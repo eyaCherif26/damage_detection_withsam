@@ -1,0 +1,51 @@
+# Decoder-only LoRA (cif_24gb.yaml) + LoRA on the DETR encoder (image-text fusion), on a class-balanced 1k CIF
+# subset, for the 24 GB RTX PRO 4000 Blackwell. Separate, opt-in config; other configs unchanged.
+# Memory: the DETR encoder only fits with optimizations.efficient_attention (the repo's LoRA attention otherwise
+# builds 5184x5184 attention matrices -> OOM). Activation checkpointing of the DETR encoder and the image encoder
+# is already on by default in SAM 3 (model_builder.py use_act_checkpoint=True). Not measured yet: smoke test first.
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
+  apply_to_vision_encoder: false   # frozen: by far the largest memory cost
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: true      # NEW vs cif_24gb.yaml: adapt the image-text fusion (needs efficient_attention)
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+optimizations:                     # opt-in; omit the block = original behaviour
+  efficient_attention: true        # required for apply_to_detr_encoder: true
+  bf16_autocast: true              # halves activation memory; set false to compare in fp32 if memory allows
+training:
+  data_dir: "/home/hydro/projects/VLM_test/data/cif_sam3_1k_bal"
+  batch_size: 1
+  num_workers: 8
+  num_negatives: 0
+  data_format: "coco"
+  prompt_source: "category_name"
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  num_epochs: 15
+  seed: 42
+  best_metric: val_macro_dice
+eval:
+  max_images: 300
+  train_max_images: 100
+  threshold: 0.5
+  no_data_validity: true
+wandb:
+  entity: eya-cherif14
+  project: damage_detection
+  run_name: sam3_lora_cif_detr_enc_1k
+  mode: online
+  log_images_every_n_epochs: 3
+  num_logged_images: 8
+output:
+  output_dir: "/home/hydro/projects/VLM_test/outputs/sam3_cif_detr_enc_1k"
+  save_lora_only: true
+hardware:
+  device: "cuda"
