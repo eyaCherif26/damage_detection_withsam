@@ -1,0 +1,48 @@
+# Smoke test for cif_detr_enc_1k.yaml (same model/LoRA/optimizations, 40 images, 1 epoch): checks that LoRA on the
+# DETR encoder runs and fits in 24 GB before the 1k run. Watch nvidia-smi for the peak memory.
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
+  apply_to_vision_encoder: false
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: true
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+optimizations:
+  efficient_attention: true
+  bf16_autocast: true
+training:
+  data_dir: "/home/hydro/projects/VLM_test/data/cif_sam3_smoke"
+  batch_size: 1
+  num_workers: 2
+  num_negatives: 0
+  data_format: "coco"
+  prompt_source: "category_name"
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  num_epochs: 1
+  seed: 42
+  best_metric: val_macro_dice
+eval:
+  max_images: null
+  train_max_images: 20
+  threshold: 0.5
+  no_data_validity: true
+wandb:
+  entity: eya-cherif14
+  project: damage_detection
+  run_name: sam3_lora_cif_detr_enc_smoke
+  mode: online
+  log_images_every_n_epochs: 1
+  num_logged_images: 4
+output:
+  output_dir: "/home/hydro/projects/VLM_test/outputs/sam3_cif_detr_enc_smoke"
+  save_lora_only: true
+hardware:
+  device: "cuda"

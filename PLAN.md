@@ -1,3 +1,10 @@
+# 2026-11-23: LoRA on the DETR encoder (image-text fusion) on 24 GB, class-balanced 1k CIF subset
+- Memory fix = opt-in efficient attention (lora_layers use_sdpa via `optimizations.efficient_attention`) + optional
+  bf16; SAM 3 already checkpoints activations in the DETR encoder and the ViT (use_act_checkpoint=True).
+- configs/cif_detr_enc_smoke.yaml (40 imgs, 1 epoch) then configs/cif_detr_enc_1k.yaml (15 epochs).
+- cif_to_sam3_coco.py --balanced_per_class K (opt-in): rarest class first, each class in >= K images.
+- Compare with cif_24gb (decoder-only) using heat-map eval on the SAME validation/test images.
+
 # 2026-11-23: lost changes re-applied (files had reverted to the ~2026-11-18 state during the git steps)
 Pushed as 3 separate branches / pull requests: (1) Full-LoRA optimizations (lora_layers use_sdpa, trainer
 `optimizations` block, configs/cif_full_24gb.yaml), (2) heat-map evaluation (sam3_eval.py --mode heatmap),
