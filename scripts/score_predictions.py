@@ -3,6 +3,8 @@
 Variants (each image is scored only if ALL requested variants exist for it, so the comparison is fair):
   base         MVP_clean prob >= its thresholds, from <image>/prob_<class>.png + run_info.json (needs no SAM 3)
   s1 s12 s123  <image>/sam3_pp/<variant>/mask_<class>.png from VLM_test/scripts/sam3_postprocess.py
+  name=path    any predictions COCO file inside each image folder, e.g. hyst=hyst/predictions.coco.json from
+               MVP_clean's postprocess_predictions.py (run it with --segmentation_format rle --min_area 0)
 Metrics (MVP_clean definitions, via sam3_eval.PixelMetrics), inside the no-data validity mask:
   pixel level per class: IoU, Dice (= F1), precision, recall; macro, macro_present, frequency_weighted
   image level presence per class: is the class in the image / did we predict it -> precision, recall, F1,
@@ -32,7 +34,23 @@ AGG = ("macro", "macro_present", "frequency_weighted")
 KEYS = ("iou", "dice", "precision", "recall")
 
 
+def coco_variant_masks(path: Path, classes: list[str], h: int, w: int) -> dict | None:
+    """Masks from a predictions COCO file whose category names are the MVP classes (e.g. MVP_clean's
+    postprocess_predictions.py output). Use segmentation_format rle there: polygon rings lose holes."""
+    if not path.exists():
+        return None
+    pred = json.loads(path.read_text())
+    name_of = {c["id"]: c["name"] for c in pred["categories"]}
+    return {c: _gt_union([a for a in pred["annotations"] if name_of.get(a["category_id"]) == c], h, w)
+            for c in classes}
+
+
 def variant_masks(d: Path, variant: str, classes: list[str], thresholds: dict) -> dict | None:
+    if "=" in variant:  # name=relative/path/predictions.coco.json
+        p0 = cv2.imread(str(d / f"prob_{classes[0]}.png"), cv2.IMREAD_GRAYSCALE)
+        if p0 is None:
+            return None
+        return coco_variant_masks(d / variant.split("=", 1)[1], classes, *p0.shape)
     out = {}
     for c in classes:
         if variant == "base":
@@ -156,7 +174,9 @@ def main() -> None:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    result = {v: {"pixel": pix[v].compute(), "presence": pres[v].compute()} for v in args.variants}
+    label = {v: v.split("=", 1)[0] for v in args.variants}  # "hyst=hyst/predictions.coco.json" -> "hyst"
+    result = {label[v]: {"pixel": pix[v].compute(), "presence": pres[v].compute()} for v in args.variants}
+    args.variants = [label[v] for v in args.variants]
     (out / "metrics.json").write_text(json.dumps(result, indent=1, default=float))
     with open(out / "metrics.csv", "w", newline="") as f:
         wr = csv.writer(f)
@@ -183,7 +203,7 @@ def main() -> None:
             if k != "images":
                 wr.writerow([k, *[per.get(c, 0) for c in classes]])
 
-    n = pres[args.variants[0]].images
+    n = result[args.variants[0]]["presence"]["images"]
     print(f"\n[score] {n} images, classes {classes}")
     print(f"{'variant':8s} {'dice':>7s} {'iou':>7s} {'prec':>7s} {'recall':>7s}  (macro_present)  "
           + "  ".join(f"{c[:10]:>10s}" for c in classes) + "  (dice per class)   presence-F1   exact-match")

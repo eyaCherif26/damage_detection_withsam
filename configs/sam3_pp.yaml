@@ -3,21 +3,77 @@
 # images you report results for.
 sam3:
   bpe_path: sam3/assets/bpe_simple_vocab_16e6.txt.gz   # relative to the SAM3_LoRA repo root (run from there)
-  bf16: false                    # true = bf16 autocast (less memory, slightly different numbers)
+  bf16: true                     # bf16 autocast: less GPU memory (needed on the 8 GB laptop)
   tile_size: 1008                # SAM 3's input size; larger images are processed in overlapping windows ...
   tile_overlap: 128
   tile_trigger: 1.5              # ... when their longest side exceeds tile_size * tile_trigger
 
 stage1_objects:                  # remove predicted damage that lies on non-structural objects
   enabled: true
-  prompts: [ladder, fender, chain, rope, bollard, pipe, railing, cable, boat, buoy, sign, vegetation, person, artifacts]
+  prompts:                       # short English noun phrases; any match removes the damage there
+    # Fender
+    - fender
+    - rubber fender
+    # Chain / rope
+    - chain
+    - rope
+    - coiled rope
+    - mooring rope
+    - thick rope
+    # Pipe
+    - pipe
+    - drain pipe
+    # Graffiti
+    - graffiti
+    # Joint (not plain "joint": too close to "crack")
+    - expansion joint
+    # Ladder / stairs
+    - ladder
+    - stairs
+    # Signs and markings (indication_signs)
+    - sign
+    - painted marking
+    # Sheet pile wall (peel_sheet / Spundwand)
+    - sheet pile wall
+    - steel sheet piling
+    # Lock (Schleuse)
+    - lock gate
+    # Vegetation (not "moss"/"algae": CIF's Wetspot class is algae)
+    - vegetation
+    - plant
+    # Stitching / image artifacts (seam_artifact)
+    - image stitching seam
+    - black border
+    # Other harbour objects from the first list
+    - bollard
+    - railing
+    - cable
+    - boat
+    - buoy
+    - person
+  look_alike_prompts:            # phrase -> damage classes the model confuses it with. Unlike `prompts`, the
+                                 # area is NOT blanked: a damage component of these classes is removed only if
+                                 # >= min_overlap of it lies inside ONE instance (+ optional size condition).
+                                 # List form = global settings below; dict form = per-phrase settings.
+    shadow: [Cracks]             # big shaded areas: keep the size condition, so real cracks in shade stay
+    branch shadow:               # thin shadows: no size condition (SAM 3 masks the whole shadow, the false
+      classes: [Cracks]          # "crack" is only a thin line inside it)
+      max_area_ratio: null
+    plant shadow:
+      classes: [Cracks]
+      max_area_ratio: null
+      score_threshold: 0.3       # best score on Seehafen2 was 0.33 (< 0.5 -> nothing was found)
+  look_alike_min_overlap: 0.5    # fraction of the damage component inside the instance
+  look_alike_max_area_ratio: 4.0 # instance area <= this x damage component area ("similar size")
   score_threshold: 0.5           # SAM 3 instance confidence for an object to count
+  log_min_score: 0.25            # also log each prompt's best score down to this value (near misses);
+                                 # leave out = log only objects >= score_threshold (previous behaviour)
   dilate_px: 3                   # grow object masks a little (damage hugging an object edge)
   component_overlap_frac: 0.5    # drop a whole damage component if >= this fraction lies on objects;
                                  # damage pixels on objects are removed in any case
 
 stage2_refine:                   # sharpen each remaining damage component with SAM 3's box/point predictor
-  enabled: true
+  enabled: false                 # off: current workflow = stage 1 + MVP_clean hysteresis post-processing
   classes: [Cracks, Wetspot, Spalling, Rust, Efflorescence]
   min_area_px: 64                # smaller components are kept unchanged
   max_components_per_class: 50   # largest first; the rest are kept unchanged (runtime cap)
@@ -29,7 +85,7 @@ stage2_refine:                   # sharpen each remaining damage component with 
   min_mean_prob_frac: 0.5        # ... and MVP_clean's mean prob inside it >= this x the class threshold
 
 stage3_add:                      # look for missed damage similar to the confirmed components
-  enabled: true
+  enabled: false                 # off: current workflow = stage 1 + MVP_clean hysteresis post-processing
   use_text: true                 # text phrase + exemplar boxes (false = exemplar boxes only)
   max_exemplars: 3               # largest confirmed components of the class in the window
   score_threshold: 0.5
