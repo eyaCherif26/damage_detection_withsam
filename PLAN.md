@@ -5,6 +5,9 @@ Pushed as 3 separate branches / pull requests: (1) Full-LoRA optimizations (lora
 sam3_pp.yaml object list + shadow rules + stages 2/3 off; score_predictions.py COCO variants).
 Experiment YAML paths are managed by the user - never changed by Claude.
 Next (user request): test-set visualisation + threshold diagnostics (presence score) in heat-map mode.
+- [x] 2026-11-23 sam3_eval.py heat-map mode: --heat_vis N (image+GT, per-class heat map with GT outline, max heat,
+  presence) and --diagnostics (diagnostics.csv + per-class presence/score summary). Opt-in, not run yet.
+  Hypothesis to test: weak Spalling/Rust = presence head too low after fine-tuning (instance score = query x presence).
 
 # SAM3 "Full" LoRA on 24 GB (2026-11-18) - opt-in, existing configs unchanged
 - New configs/cif_full_24gb.yaml: LoRA on all components except text encoder (as repo full_lora_config), rank 32,
