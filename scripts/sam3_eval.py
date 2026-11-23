@@ -187,6 +187,118 @@ def evaluate_split(
 no_data_validity_fn = no_data_validity  # alias: evaluate_split's flag argument shadows the function name
 
 
+# ---------------------------------------------------------------- heat-map (semantic) evaluation, opt-in
+class HeatmapMetrics:
+    """Per-class pixel metrics from continuous heat maps, threshold-free: heat values are binned (1/bins), so
+    TP/FP/FN at every threshold k/bins, the best-Dice threshold and pixel AP come from two histograms per class.
+    Same formulas/eps as PixelMetrics (= MVP_clean)."""
+
+    def __init__(self, class_names: list[str], bins: int = 100) -> None:
+        self.class_names, self.bins = class_names, bins
+        self.pos = np.zeros((len(class_names), bins), dtype=np.float64)  # GT pixels per heat bin
+        self.neg = np.zeros((len(class_names), bins), dtype=np.float64)  # non-GT pixels per heat bin
+
+    def update(self, idx: int, heat: np.ndarray, gt: np.ndarray, valid: np.ndarray) -> None:
+        q = np.minimum((heat * self.bins).astype(np.int64), self.bins - 1)
+        self.pos[idx] += np.bincount(q[gt & valid], minlength=self.bins)
+        self.neg[idx] += np.bincount(q[~gt & valid], minlength=self.bins)
+
+    def _counts(self, i: int, k: int) -> tuple[float, float, float]:
+        """TP, FP, FN for class i when predicting heat >= k / bins."""
+        return self.pos[i, k:].sum(), self.neg[i, k:].sum(), self.pos[i, :k].sum()
+
+    def compute(self, thresholds: dict | None = None, fixed: float = 0.5) -> dict:
+        per = {}
+        for i, c in enumerate(self.class_names):
+            t = (thresholds or {}).get(c, fixed)
+            tp, fp, fn = self._counts(i, int(round(t * self.bins)))
+            # sweep: best Dice over thresholds 1/bins .. (bins-1)/bins
+            ks = np.arange(1, self.bins)
+            tps = np.array([self.pos[i, k:].sum() for k in ks])
+            fps = np.array([self.neg[i, k:].sum() for k in ks])
+            fns = self.pos[i].sum() - tps
+            dices = 2 * tps / (2 * tps + fps + fns + EPS)
+            b = int(np.argmax(dices))
+            # pixel AP: precision-recall from the highest heat bin downwards (step interpolation)
+            ctp, cfp = np.cumsum(self.pos[i, ::-1]), np.cumsum(self.neg[i, ::-1])
+            total = self.pos[i].sum()
+            rec = ctp / max(total, EPS)
+            prec = ctp / np.maximum(ctp + cfp, EPS)
+            ap = float(np.sum(np.diff(np.concatenate([[0.0], rec])) * prec)) if total > 0 else float("nan")
+            per[c] = {"threshold": round(float(t), 3), "iou": tp / (tp + fp + fn + EPS),
+                      "dice": 2 * tp / (2 * tp + fp + fn + EPS), "precision": tp / (tp + fp + EPS),
+                      "recall": tp / (tp + fn + EPS), "best_threshold": round(float(ks[b] / self.bins), 3),
+                      "best_dice": float(dices[b]), "pixel_ap": ap, "gt_pixels": int(total)}
+        present = [c for c in self.class_names if per[c]["gt_pixels"] > 0]
+        mean = lambda cs, k: float(np.mean([per[c][k] for c in cs])) if cs else float("nan")
+        keys = ("iou", "dice", "precision", "recall", "best_dice", "pixel_ap")
+        return {"per_class": per,
+                "macro": {k: mean(self.class_names, k) for k in keys if k != "pixel_ap"},
+                "macro_present": {k: mean(present, k) for k in keys}}
+
+
+@torch.inference_mode()
+def class_heatmap(proc, state: dict, phrase: str, out_hw: tuple[int, int]) -> np.ndarray:
+    """Heat map for one text phrase: per pixel the max over ALL of SAM 3's query slots of
+    (instance score x mask probability) - no confidence threshold, no NMS. Mirrors
+    Sam3Processor._forward_grounding (score = query prob x presence prob), computed at mask resolution and
+    upsampled once to out_hw."""
+    import torch.nn.functional as F
+
+    model = proc.model
+    state["backbone_out"].update(model.backbone.forward_text([phrase], device=proc.device))
+    if "geometric_prompt" not in state:
+        state["geometric_prompt"] = model._get_dummy_prompt()
+    out = model.forward_grounding(backbone_out=state["backbone_out"], find_input=proc.find_stage,
+                                  geometric_prompt=state["geometric_prompt"], find_target=None)
+    scores = (out["pred_logits"].sigmoid() * out["presence_logit_dec"].sigmoid().unsqueeze(1)).squeeze(-1)[0]
+    heat = (scores[:, None, None] * out["pred_masks"][0].sigmoid()).amax(0)  # (h, w)
+    heat = F.interpolate(heat[None, None].float(), size=out_hw, mode="bilinear", align_corners=False)[0, 0]
+    proc.reset_all_prompts(state)
+    return heat.clamp(0, 1).cpu().numpy()
+
+
+def evaluate_split_heatmap(model, split_dir: str | Path, max_images: int | None = None,
+                           phrases: dict[str, list[str]] | None = None, no_data_validity: bool = True,
+                           bf16: bool = False, save_dir: Path | None = None, progress: bool = True) -> dict:
+    """Semantic evaluation: one heat map per class (max over its phrases), accumulated in HeatmapMetrics.
+    save_dir: also write each image's heat maps in MVP_clean's format (<save_dir>/<stem>/prob_<class>.png +
+    run_info.json), so MVP_clean's post-processing / scoring tools can read SAM 3 output directly."""
+    from sam3.model.sam3_image_processor import Sam3Processor
+
+    split_dir = Path(split_dir)
+    coco = json.loads((split_dir / "_annotations.coco.json").read_text())
+    cats = sorted(coco["categories"], key=lambda c: c["id"])
+    class_names = [c.get("mvp_class", c["name"]) for c in cats]
+    queries = [(phrases or {}).get(c["name"], [c["name"]]) for c in cats]
+    by_img = defaultdict(list)
+    for a in coco["annotations"]:
+        by_img[a["image_id"]].append(a)
+    images = coco["images"][:max_images] if max_images else coco["images"]
+    proc = Sam3Processor(model)
+    acc = HeatmapMetrics(class_names)
+    for im in tqdm(images, desc=f"heatmap eval {split_dir.name}", disable=not progress):
+        img = np.array(Image.open(split_dir / im["file_name"]).convert("RGB"))
+        h, w = img.shape[:2]
+        valid = no_data_validity_fn(img) if no_data_validity else np.ones((h, w), dtype=bool)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            state = proc.set_image(Image.fromarray(img))
+            heats = [np.max([class_heatmap(proc, state, p, (h, w)) for p in qs], axis=0) for qs in queries]
+        for i, cat in enumerate(cats):
+            gt = _gt_union([a for a in by_img[im["id"]] if a["category_id"] == cat["id"]], h, w)
+            acc.update(i, heats[i], gt, valid)
+        if save_dir is not None:
+            d = Path(save_dir) / Path(im["file_name"]).stem
+            d.mkdir(parents=True, exist_ok=True)
+            for name, heat in zip(class_names, heats):
+                cv2.imwrite(str(d / f"prob_{name}.png"), np.round(heat * 255).astype(np.uint8))
+            (d / "run_info.json").write_text(json.dumps({
+                "image": str((split_dir / im["file_name"]).resolve()), "image_size": [w, h], "crop_xywh": None,
+                "thresholds": {n: 0.5 for n in class_names}, "source": "SAM 3 heat maps (sam3_eval.py --mode heatmap)"},
+                indent=2))
+    return {"heatmap": acc, "class_names": class_names}
+
+
 # ---------------------------------------------------------------- logging helpers (MVP_clean W&B layout)
 def mvp_clean_log_dict(train_m: dict, val_m: dict, train_loss: float, val_loss: float, lr: float) -> dict:
     """Same keys as MVP_clean/training/trainer.py's per-epoch log (lr_backbone/lr_head -> one `lr` here)."""
@@ -244,6 +356,16 @@ def main() -> None:
     p.add_argument("--max_gpu_fraction", type=float, default=None, help="optional hard cap on GPU memory")
     p.add_argument("--bpe_path", default="sam3/assets/bpe_simple_vocab_16e6.txt.gz")
     p.add_argument("--wandb", action="store_true", help="log metrics/table/images as a W&B run (config's wandb block)")
+    p.add_argument("--mode", choices=["instances", "heatmap"], default="instances",
+                   help="instances (default, unchanged): union of instances with score >= --threshold. "
+                        "heatmap: per-class heat map = max over all query slots of score x mask prob (no threshold, "
+                        "no NMS); reports metrics at --threshold (or --thresholds), the best-Dice threshold per "
+                        "class and threshold-free pixel AP")
+    p.add_argument("--thresholds", help="heatmap mode: JSON {class: threshold}, e.g. thresholds_best.json from a "
+                                        "val run, to apply on test (choose on val, report on test)")
+    p.add_argument("--save_heatmaps", action="store_true",
+                   help="heatmap mode: also write <out>/heatmaps/<image>/prob_<class>.png + run_info.json "
+                        "(MVP_clean format)")
     args = p.parse_args()
 
     sys.path.insert(0, os.getcwd())  # SAM3_LoRA root: lora_layers.py lives there (not pip-installed)
@@ -266,6 +388,9 @@ def main() -> None:
     model.to("cuda").eval()
 
     phrases = yaml.safe_load(Path(args.prompts).read_text()) if args.prompts else None
+    if args.mode == "heatmap":
+        _main_heatmap(args, model, phrases, cfg)
+        return
     res = evaluate_split(model, args.split_dir, args.max_images, args.threshold, phrases, num_vis=args.num_vis,
                          no_data_validity=not args.no_validity, collect_predictions=True, bf16=args.bf16)
 
@@ -304,6 +429,40 @@ def main() -> None:
                    f"{split}/per_class_table": wandb_per_class_table(wandb, met["per_class"]),
                    f"{split}/predictions": wandb_images(wandb, res["vis"], res["class_names"])})
         wandb.finish()
+
+
+def _main_heatmap(args, model, phrases, cfg: dict) -> None:
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    thresholds = json.loads(Path(args.thresholds).read_text()) if args.thresholds else None
+    res = evaluate_split_heatmap(model, args.split_dir, args.max_images, phrases,
+                                 no_data_validity=not args.no_validity, bf16=args.bf16,
+                                 save_dir=out / "heatmaps" if args.save_heatmaps else None)
+    met = res["heatmap"].compute(thresholds, fixed=args.threshold)
+    (out / "metrics_heatmap.json").write_text(json.dumps(met, indent=2))
+    (out / "thresholds_best.json").write_text(json.dumps(
+        {c: m["best_threshold"] for c, m in met["per_class"].items()}, indent=2))
+    cols = ["threshold", "iou", "dice", "precision", "recall", "best_threshold", "best_dice", "pixel_ap", "gt_pixels"]
+    with open(out / "metrics_heatmap.csv", "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["class"] + cols)
+        for c, m in met["per_class"].items():
+            wr.writerow([c] + [m[k] if k == "gt_pixels" else f"{m[k]:.4f}" for k in cols])
+        for agg in ("macro", "macro_present"):
+            wr.writerow([agg] + [f"{met[agg][k]:.4f}" if k in met[agg] else "" for k in cols])
+    src = f"thresholds from {args.thresholds}" if thresholds else f"fixed threshold {args.threshold}"
+    print(f"\nheat-map metrics ({src}); best_* = best threshold chosen on THIS split (optimistic)")
+    print(f"{'class':15s} {'thr':>5s} {'iou':>7s} {'dice':>7s} {'prec':>7s} {'recall':>7s} "
+          f"{'best_thr':>8s} {'best_dice':>9s} {'pixel_AP':>8s} {'gt_pixels':>10s}")
+    for c, m in met["per_class"].items():
+        print(f"{c:15s} {m['threshold']:5.2f} {m['iou']:7.4f} {m['dice']:7.4f} {m['precision']:7.4f} "
+              f"{m['recall']:7.4f} {m['best_threshold']:8.2f} {m['best_dice']:9.4f} {m['pixel_ap']:8.4f} "
+              f"{m['gt_pixels']:10d}")
+    mp = met["macro_present"]
+    print(f"{'macro_present':15s} {'':5s} {mp['iou']:7.4f} {mp['dice']:7.4f} {mp['precision']:7.4f} "
+          f"{mp['recall']:7.4f} {'':8s} {mp['best_dice']:9.4f} {mp['pixel_ap']:8.4f}")
+    print(f"\n-> {out / 'metrics_heatmap.csv'}, {out / 'thresholds_best.json'}"
+          + (f", heat maps in {out / 'heatmaps'}" if args.save_heatmaps else ""))
 
 
 if __name__ == "__main__":
