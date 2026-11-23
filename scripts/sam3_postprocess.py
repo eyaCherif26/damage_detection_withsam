@@ -10,11 +10,12 @@ Input   --pred_root/<image>/   one folder per image from MVP_clean scripts/infer
 Output  --pred_root/<image>/sam3_pp/
           base/ s1/ s12/ s123/   mask_<class>.png (0/255, original size); base = MVP_clean prob >= its thresholds
           objects.png            union of the SAM 3 object masks used by stage 1
-        --pred_root/<image>/sam3_filtered/   (stage 1) prob_<class>.png zeroed on objects + removed components,
-          and run_info.json -> input for MVP_clean's hysteresis: postprocess_predictions.py --input_dir <this>
+          look_alikes.png        look-alike instances (e.g. shadows), if look_alike_prompts are configured
           predictions.coco.json  last variant: one instance per connected component (RLE; score = mean MVP_clean prob)
           overlay.jpg            last variant over the image, MVP_clean class colours, objects tinted grey
           sam3_info.json         settings + every decision (removed / refined / added components)
+        --pred_root/<image>/sam3_filtered/   (stage 1) prob_<class>.png zeroed on objects + removed components,
+          and run_info.json -> input for MVP_clean's hysteresis: postprocess_predictions.py --input_dir <this>
 
 Run from the SAM3_LoRA repo root in sam3_lora_env (24 GB GPU):
     python ../scripts/sam3_postprocess.py --pred_root <mvp outputs> --images_dir <images> --config ../configs/sam3_pp.yaml
@@ -105,6 +106,19 @@ def components(mask: np.ndarray) -> tuple[np.ndarray, int, np.ndarray]:
 
 
 # ---------------------------------------------------------------- stage 1
+def look_alike_spec(value, c1: dict) -> tuple[list, float, float | None, float]:
+    """look_alike_prompts entry -> (classes, min_overlap, max_area_ratio or None, score_threshold).
+    List form `phrase: [Cracks]` = global settings; dict form
+    `phrase: {classes: [...], min_overlap: .., max_area_ratio: null, score_threshold: ..}` overrides per phrase
+    (max_area_ratio: null = no size condition)."""
+    g_overlap = c1.get("look_alike_min_overlap", 0.5)
+    g_ratio = c1.get("look_alike_max_area_ratio", 4.0)
+    if isinstance(value, dict):
+        return (list(value["classes"]), value.get("min_overlap", g_overlap),
+                value.get("max_area_ratio", g_ratio), value.get("score_threshold", c1["score_threshold"]))
+    return list(value), g_overlap, g_ratio, c1["score_threshold"]
+
+
 def detect_objects(proc, img: np.ndarray, cfg: dict, wins: list) -> tuple[np.ndarray, dict, dict, dict]:
     """Object prompts -> one union mask (damage there is removed). Look-alike prompts (optional) -> kept as
     separate instances (y0, x0, cropped mask) per phrase, used by remove_look_alikes()."""
@@ -141,19 +155,6 @@ def detect_objects(proc, img: np.ndarray, cfg: dict, wins: list) -> tuple[np.nda
     if d > 0:
         obj = cv2.dilate(obj.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1))) > 0
     return obj, found, {p: round(s, 3) for p, s in best.items()}, instances
-
-
-def look_alike_spec(value, c1: dict) -> tuple[list, float, float | None, float]:
-    """look_alike_prompts entry -> (classes, min_overlap, max_area_ratio or None, score_threshold).
-    List form `phrase: [Cracks]` = global settings (original behaviour); dict form
-    `phrase: {classes: [...], min_overlap: .., max_area_ratio: null, score_threshold: ..}` overrides per phrase
-    (max_area_ratio: null = no size condition)."""
-    g_overlap = c1.get("look_alike_min_overlap", 0.5)
-    g_ratio = c1.get("look_alike_max_area_ratio", 4.0)
-    if isinstance(value, dict):
-        return (list(value["classes"]), value.get("min_overlap", g_overlap),
-                value.get("max_area_ratio", g_ratio), value.get("score_threshold", c1["score_threshold"]))
-    return list(value), g_overlap, g_ratio, c1["score_threshold"]
 
 
 def remove_look_alikes(mask: np.ndarray, instances: list, min_overlap: float, max_area_ratio: float | None,
