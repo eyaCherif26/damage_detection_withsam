@@ -18,6 +18,11 @@ class MultiheadAttentionLoRA(nn.Module):
     This replaces nn.MultiheadAttention to enable LoRA on all projection layers.
     """
 
+    # VLM_test patch (opt-in, default off = original code path): when True, attention is computed with
+    # F.scaled_dot_product_attention (memory-efficient kernels) instead of materialising the full
+    # (batch, heads, tgt_len, src_len) matrix. Enabled per run via `optimizations.efficient_attention`.
+    use_sdpa = False
+
     def __init__(
         self,
         embed_dim: int,
@@ -105,6 +110,18 @@ class MultiheadAttentionLoRA(nn.Module):
         k = k.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+        if self.use_sdpa and not need_weights:  # VLM_test patch (opt-in): same math, no full attention matrix
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=self._sdpa_bias(attn_mask, key_padding_mask, batch_size, tgt_len, src_len, q.dtype),
+                dropout_p=self.dropout if self.training else 0.0,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.embed_dim)
+            attn_output = self.out_proj(attn_output)
+            if not self.batch_first:
+                attn_output = attn_output.transpose(0, 1)
+            return attn_output, None
+
         # Scaled dot-product attention
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
@@ -170,6 +187,31 @@ class MultiheadAttentionLoRA(nn.Module):
             return attn_output, attn_weights
         else:
             return attn_output, None
+
+    def _sdpa_bias(self, attn_mask, key_padding_mask, batch_size, tgt_len, src_len, dtype):
+        """VLM_test patch: the masks of the original path as one additive float bias for SDPA
+        (bool True = masked -> -inf, float masks added), same shape handling as forward()."""
+        bias = None
+        if attn_mask is not None:
+            m = attn_mask
+            if m.dim() == 2:
+                m = m.view(1, 1, tgt_len, src_len)
+            elif m.dim() == 3:
+                if m.shape[0] == batch_size:
+                    m = m.unsqueeze(1)
+                elif m.shape[0] == batch_size * self.num_heads:
+                    m = m.view(batch_size, self.num_heads, tgt_len, src_len)
+                else:
+                    m = m.unsqueeze(1)
+            if m.dtype == torch.bool:
+                bias = torch.zeros(m.shape, dtype=dtype, device=m.device).masked_fill(m, float("-inf"))
+            else:
+                bias = m.to(dtype)
+        if key_padding_mask is not None:
+            kp = torch.zeros(batch_size, 1, 1, src_len, dtype=dtype, device=key_padding_mask.device)
+            kp = kp.masked_fill(key_padding_mask.view(batch_size, 1, 1, src_len).bool(), float("-inf"))
+            bias = kp if bias is None else bias + kp
+        return bias
 
 
 class LoRALayer(nn.Module):
