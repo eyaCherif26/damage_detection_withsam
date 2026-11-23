@@ -1086,6 +1086,41 @@ class SAM3TrainerNative:
             normalize_by_valid_object_num=False,
         )
         
+    @staticmethod
+    def _floats_to_fp32(obj, _seen=None):
+        """VLM_test patch (used only with optimizations.bf16_autocast): cast the low-precision float tensors
+        inside the model outputs (dicts / lists / output objects, in place) back to float32 so the matcher and
+        losses run exactly as in the fp32 path."""
+        _seen = set() if _seen is None else _seen
+        if id(obj) in _seen:
+            return
+        _seen.add(id(obj))
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if torch.is_tensor(v):
+                    if v.is_floating_point() and v.dtype != torch.float32:
+                        obj[k] = v.float()
+                else:
+                    SAM3TrainerNative._floats_to_fp32(v, _seen)
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                if torch.is_tensor(v):
+                    if v.is_floating_point() and v.dtype != torch.float32:
+                        obj[i] = v.float()
+                else:
+                    SAM3TrainerNative._floats_to_fp32(v, _seen)
+        elif isinstance(obj, tuple):
+            for v in obj:
+                if not torch.is_tensor(v):
+                    SAM3TrainerNative._floats_to_fp32(v, _seen)
+        elif hasattr(obj, "__dict__") and not isinstance(obj, nn.Module):
+            for k, v in list(vars(obj).items()):
+                if torch.is_tensor(v):
+                    if v.is_floating_point() and v.dtype != torch.float32:
+                        setattr(obj, k, v.float())
+                else:
+                    SAM3TrainerNative._floats_to_fp32(v, _seen)
+
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
@@ -1232,6 +1267,20 @@ class SAM3TrainerNative:
             import wandb
             wandb_run = wandb.init(entity=wb_cfg.get("entity"), project=wb_cfg.get("project"), name=run_name,
                                    config=self.config, mode=wb_cfg["mode"])
+        # Opt-in memory optimizations (new `optimizations:` block; absent = original behaviour). The repo's own
+        # `mixed_precision` key is deliberately NOT used: existing configs contain it and it was always ignored.
+        opt_cfg = self.config.get("optimizations") or {}
+        use_bf16 = bool(opt_cfg.get("bf16_autocast", False))
+        if opt_cfg.get("efficient_attention", False):
+            from lora_layers import MultiheadAttentionLoRA
+            n_sdpa = 0
+            for m in self.model.modules():
+                if isinstance(m, MultiheadAttentionLoRA):
+                    m.use_sdpa = True
+                    n_sdpa += 1
+            print_rank0(f"[optimizations] efficient attention on {n_sdpa} LoRA attention modules")
+        if use_bf16:
+            print_rank0("[optimizations] bf16 autocast for the model forward (outputs cast back to float32)")
         # --- end VLM_test patch ---
 
         for epoch in range(epochs):
@@ -1253,7 +1302,10 @@ class SAM3TrainerNative:
 
                 # Forward pass
                 # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
-                outputs_list = self.model(input_batch)
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):  # VLM_test patch (opt-in)
+                    outputs_list = self.model(input_batch)
+                if use_bf16:
+                    self._floats_to_fp32(outputs_list)
 
                 # Prepare targets for loss
                 # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
@@ -1315,7 +1367,10 @@ class SAM3TrainerNative:
                         input_batch = move_to_device(input_batch, self.device)
 
                         # Forward pass
-                        outputs_list = self.model(input_batch)
+                        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):  # VLM_test patch (opt-in)
+                            outputs_list = self.model(input_batch)
+                        if use_bf16:
+                            self._floats_to_fp32(outputs_list)
 
                         # Prepare targets
                         find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
