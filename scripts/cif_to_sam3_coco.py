@@ -22,11 +22,11 @@ from pathlib import Path
 import yaml
 
 DEFAULT_PROMPTS = {
-    "Cracks": "Cracks",
-    "Wetspot": "Wetspot",
-    "Spalling": "Spalling",
-    "Rust": "Rust",
-    "Efflorescence": "Efflorescence",
+    "Cracks": "crack",
+    "Wetspot": "wet spot",
+    "Spalling": "spalling",
+    "Rust": "rust",
+    "Efflorescence": "efflorescence",
 }
 
 

@@ -17,10 +17,10 @@ lora:
   apply_to_detr_decoder: true
   apply_to_mask_decoder: true
 training:
-  data_dir: "/home/hydro/projects/VLM_test/data/cif_sam3_full"
+  data_dir: "/home/eyacherif/Projects/VLM_test/data/cif_sam3_full"
   batch_size: 1                    # batch 2 ran out of memory on 24 GB
   num_workers: 8
-  num_negatives: 0                 # lower to 0-1 if it still runs out of memory
+  num_negatives: 3                 # lower to 0-1 if it still runs out of memory
   data_format: "coco"
   prompt_source: "category_name"
   learning_rate: 1e-4
@@ -41,7 +41,7 @@ wandb:                             # same keys as MVP_clean's wandb block
   log_images_every_n_epochs: 5
   num_logged_images: 8
 output:
-  output_dir: "/home/hydro/projects/VLM_test/outputs/sam3_cif_24gb"
+  output_dir: "/home/eyacherif/Projects/VLM_test/outputs/sam3_cif_24gb"
   save_lora_only: true
 hardware:
   device: "cuda"

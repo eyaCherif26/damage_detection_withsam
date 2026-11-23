@@ -16,10 +16,10 @@ lora:
   apply_to_detr_decoder: true
   apply_to_mask_decoder: true
 training:
-  data_dir: "/home/hydro/projects/VLM_test/data/cif_sam3_smoke"
+  data_dir: "/home/eyacherif/Projects/VLM_test/data/cif_sam3_smoke"
   batch_size: 1
   num_workers: 2
-  num_negatives: 0
+  num_negatives: 3
   data_format: "coco"
   prompt_source: "category_name"
   learning_rate: 1e-4
@@ -40,7 +40,7 @@ wandb:                             # same keys as MVP_clean's wandb block
   log_images_every_n_epochs: 1     # every epoch for the 2-epoch smoke test
   num_logged_images: 4
 output:
-  output_dir: "/home/hydro/projects/VLM_test/outputs/sam3_cif_smoke"
+  output_dir: "/home/eyacherif/Projects/VLM_test/outputs/sam3_cif_smoke"
   save_lora_only: true
 hardware:
   device: "cuda"
