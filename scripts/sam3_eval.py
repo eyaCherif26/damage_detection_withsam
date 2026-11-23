@@ -238,11 +238,11 @@ class HeatmapMetrics:
 
 
 @torch.inference_mode()
-def class_heatmap(proc, state: dict, phrase: str, out_hw: tuple[int, int]) -> np.ndarray:
+def class_heatmap(proc, state: dict, phrase: str, out_hw: tuple[int, int], return_stats: bool = False):
     """Heat map for one text phrase: per pixel the max over ALL of SAM 3's query slots of
     (instance score x mask probability) - no confidence threshold, no NMS. Mirrors
     Sam3Processor._forward_grounding (score = query prob x presence prob), computed at mask resolution and
-    upsampled once to out_hw."""
+    upsampled once to out_hw. return_stats=True also returns {presence, max_query_prob, max_score}."""
     import torch.nn.functional as F
 
     model = proc.model
@@ -254,16 +254,54 @@ def class_heatmap(proc, state: dict, phrase: str, out_hw: tuple[int, int]) -> np
     scores = (out["pred_logits"].sigmoid() * out["presence_logit_dec"].sigmoid().unsqueeze(1)).squeeze(-1)[0]
     heat = (scores[:, None, None] * out["pred_masks"][0].sigmoid()).amax(0)  # (h, w)
     heat = F.interpolate(heat[None, None].float(), size=out_hw, mode="bilinear", align_corners=False)[0, 0]
+    stats = {"presence": float(out["presence_logit_dec"].sigmoid().max()),
+             "max_query_prob": float(out["pred_logits"].sigmoid().max()),
+             "max_score": float(scores.max())}
     proc.reset_all_prompts(state)
-    return heat.clamp(0, 1).cpu().numpy()
+    heat = heat.clamp(0, 1).cpu().numpy()
+    return (heat, stats) if return_stats else heat
+
+
+def _put_label(panel: np.ndarray, text: str) -> np.ndarray:
+    p = panel.copy()
+    cv2.putText(p, text, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(p, text, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    return p
+
+
+def heat_strip(img: np.ndarray, gts: list, heats: list, class_names: list[str], stats: list[dict],
+               side: int = 384) -> np.ndarray:
+    """One RGB strip: image + coloured GT, then per class the heat map (JET colormap: blue low .. red high)
+    over the image with the GT outline in white, labelled with max heat and SAM 3's presence score."""
+    h, w = img.shape[:2]
+    s = side / max(h, w)
+    size = (max(1, round(w * s)), max(1, round(h * s)))
+    base = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    gt_panel = base.copy()
+    small_gts = [cv2.resize(g.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) for g in gts]
+    for i, g in enumerate(small_gts):
+        m = g.astype(bool)
+        gt_panel[m] = (0.5 * gt_panel[m] + 0.5 * np.array(COLORS[i % len(COLORS)])).astype(np.uint8)
+    panels = [_put_label(gt_panel, "image + GT")]
+    for name, heat, g, st in zip(class_names, heats, small_gts, stats):
+        hs = cv2.resize(heat.astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
+        cm = cv2.applyColorMap(np.round(hs * 255).astype(np.uint8), cv2.COLORMAP_JET)[:, :, ::-1]
+        p = np.ascontiguousarray((0.55 * cm + 0.45 * base).astype(np.uint8))
+        contours, _ = cv2.findContours(g, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(p, contours, -1, (255, 255, 255), 1)
+        panels.append(_put_label(p, f"{name} max={st['max_heat']:.2f} pres={st['presence']:.2f}"))
+    return np.hstack(panels)
 
 
 def evaluate_split_heatmap(model, split_dir: str | Path, max_images: int | None = None,
                            phrases: dict[str, list[str]] | None = None, no_data_validity: bool = True,
-                           bf16: bool = False, save_dir: Path | None = None, progress: bool = True) -> dict:
+                           bf16: bool = False, save_dir: Path | None = None, progress: bool = True,
+                           vis_dir: Path | None = None, num_vis: int = 0) -> dict:
     """Semantic evaluation: one heat map per class (max over its phrases), accumulated in HeatmapMetrics.
     save_dir: also write each image's heat maps in MVP_clean's format (<save_dir>/<stem>/prob_<class>.png +
-    run_info.json), so MVP_clean's post-processing / scoring tools can read SAM 3 output directly."""
+    run_info.json), so MVP_clean's post-processing / scoring tools can read SAM 3 output directly.
+    vis_dir + num_vis: write heat_strip() images for the first num_vis images.
+    Always returns per image and class diagnostics (presence, max query prob, max score, max heat, GT pixels)."""
     from sam3.model.sam3_image_processor import Sam3Processor
 
     split_dir = Path(split_dir)
@@ -277,16 +315,31 @@ def evaluate_split_heatmap(model, split_dir: str | Path, max_images: int | None 
     images = coco["images"][:max_images] if max_images else coco["images"]
     proc = Sam3Processor(model)
     acc = HeatmapMetrics(class_names)
-    for im in tqdm(images, desc=f"heatmap eval {split_dir.name}", disable=not progress):
+    diag = []
+    for k, im in enumerate(tqdm(images, desc=f"heatmap eval {split_dir.name}", disable=not progress)):
         img = np.array(Image.open(split_dir / im["file_name"]).convert("RGB"))
         h, w = img.shape[:2]
         valid = no_data_validity_fn(img) if no_data_validity else np.ones((h, w), dtype=bool)
+        heats, stats = [], []
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
             state = proc.set_image(Image.fromarray(img))
-            heats = [np.max([class_heatmap(proc, state, p, (h, w)) for p in qs], axis=0) for qs in queries]
+            for qs in queries:  # several phrases per class -> max over phrases
+                res = [class_heatmap(proc, state, p, (h, w), return_stats=True) for p in qs]
+                heats.append(np.max([r[0] for r in res], axis=0))
+                stats.append({key: max(r[1][key] for r in res) for key in res[0][1]})
+        gts = []
         for i, cat in enumerate(cats):
             gt = _gt_union([a for a in by_img[im["id"]] if a["category_id"] == cat["id"]], h, w)
             acc.update(i, heats[i], gt, valid)
+            gts.append(gt & valid)
+            stats[i]["max_heat"] = float(heats[i].max())
+            diag.append({"file_name": im["file_name"], "class": class_names[i], "gt_pixels": int(gts[i].sum()),
+                         **{key: round(v, 4) for key, v in stats[i].items()}})
+        if vis_dir is not None and k < num_vis:
+            Path(vis_dir).mkdir(parents=True, exist_ok=True)
+            strip = heat_strip(img, gts, heats, class_names, stats)
+            cv2.imwrite(str(Path(vis_dir) / f"{Path(im['file_name']).stem}_heat.jpg"),
+                        cv2.cvtColor(strip, cv2.COLOR_RGB2BGR))
         if save_dir is not None:
             d = Path(save_dir) / Path(im["file_name"]).stem
             d.mkdir(parents=True, exist_ok=True)
@@ -296,7 +349,7 @@ def evaluate_split_heatmap(model, split_dir: str | Path, max_images: int | None 
                 "image": str((split_dir / im["file_name"]).resolve()), "image_size": [w, h], "crop_xywh": None,
                 "thresholds": {n: 0.5 for n in class_names}, "source": "SAM 3 heat maps (sam3_eval.py --mode heatmap)"},
                 indent=2))
-    return {"heatmap": acc, "class_names": class_names}
+    return {"heatmap": acc, "class_names": class_names, "diagnostics": diag}
 
 
 # ---------------------------------------------------------------- logging helpers (MVP_clean W&B layout)
@@ -366,6 +419,12 @@ def main() -> None:
     p.add_argument("--save_heatmaps", action="store_true",
                    help="heatmap mode: also write <out>/heatmaps/<image>/prob_<class>.png + run_info.json "
                         "(MVP_clean format)")
+    p.add_argument("--heat_vis", type=int, default=0,
+                   help="heatmap mode: write <out>/vis/<image>_heat.jpg for the first N images (image + GT, "
+                        "then one heat map per class with the GT outline, max heat and presence score)")
+    p.add_argument("--diagnostics", action="store_true",
+                   help="heatmap mode: write <out>/diagnostics.csv (per image and class: GT pixels, presence "
+                        "score, max query prob, max instance score, max heat) and print a per-class summary")
     args = p.parse_args()
 
     sys.path.insert(0, os.getcwd())  # SAM3_LoRA root: lora_layers.py lives there (not pip-installed)
@@ -431,13 +490,40 @@ def main() -> None:
         wandb.finish()
 
 
+def _write_diagnostics(out: Path, rows: list, class_names: list[str], thr: float) -> None:
+    """diagnostics.csv + per-class summary: is the class 'seen' (presence / scores) on images that contain it
+    vs images that don't, and how often an instance would pass the instance threshold `thr`."""
+    cols = ["file_name", "class", "gt_pixels", "presence", "max_query_prob", "max_score", "max_heat"]
+    with open(out / "diagnostics.csv", "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=cols)
+        wr.writeheader()
+        wr.writerows(rows)
+    print(f"\ndiagnostics per class (pos = images WITH the class in GT, neg = images WITHOUT it):")
+    print(f"{'class':15s} {'n_pos':>5s} {'n_neg':>5s} {'presence pos':>12s} {'presence neg':>12s} "
+          f"{'score pos':>9s} {'score neg':>9s} {f'pos>={thr}':>9s} {f'neg>={thr}':>9s}")
+    for c in class_names:
+        pos = [r for r in rows if r["class"] == c and r["gt_pixels"] > 0]
+        neg = [r for r in rows if r["class"] == c and r["gt_pixels"] == 0]
+        mean = lambda rs, k: float(np.mean([r[k] for r in rs])) if rs else float("nan")
+        share = lambda rs: float(np.mean([r["max_score"] >= thr for r in rs])) if rs else float("nan")
+        print(f"{c:15s} {len(pos):5d} {len(neg):5d} {mean(pos, 'presence'):12.3f} {mean(neg, 'presence'):12.3f} "
+              f"{mean(pos, 'max_score'):9.3f} {mean(neg, 'max_score'):9.3f} {share(pos):9.2f} {share(neg):9.2f}")
+    print(f"  presence = SAM 3's 'concept in image' probability; score = best instance score (query x presence);"
+          f"\n  pos>={thr}: share of images WITH the class where at least one instance passes {thr} (instance mode"
+          f"\n  would predict something); neg>={thr}: same on images WITHOUT the class (false-alarm images)."
+          f"\n  -> {out / 'diagnostics.csv'}")
+
+
 def _main_heatmap(args, model, phrases, cfg: dict) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     thresholds = json.loads(Path(args.thresholds).read_text()) if args.thresholds else None
     res = evaluate_split_heatmap(model, args.split_dir, args.max_images, phrases,
                                  no_data_validity=not args.no_validity, bf16=args.bf16,
-                                 save_dir=out / "heatmaps" if args.save_heatmaps else None)
+                                 save_dir=out / "heatmaps" if args.save_heatmaps else None,
+                                 vis_dir=out / "vis" if args.heat_vis else None, num_vis=args.heat_vis)
+    if args.diagnostics:
+        _write_diagnostics(out, res["diagnostics"], res["class_names"], args.threshold)
     met = res["heatmap"].compute(thresholds, fixed=args.threshold)
     (out / "metrics_heatmap.json").write_text(json.dumps(met, indent=2))
     (out / "thresholds_best.json").write_text(json.dumps(
