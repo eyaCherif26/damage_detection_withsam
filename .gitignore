@@ -1,0 +1,15 @@
+data/
+outputs/
+wandb/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.tgz
+*.zip
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+SAM3_LoRA/outputs/
+SAM3_LoRA/logs/

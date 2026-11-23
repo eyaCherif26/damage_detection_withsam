@@ -1,0 +1,47 @@
+# SAM 3 (zero-shot) post-processing of MVP_clean predictions - settings for VLM_test/scripts/sam3_postprocess.py.
+# Thresholds below are starting values: tune them on CIF val / a calibration half of infra_hafen, never on the
+# images you report results for.
+sam3:
+  bpe_path: sam3/assets/bpe_simple_vocab_16e6.txt.gz   # relative to the SAM3_LoRA repo root (run from there)
+  bf16: false                    # true = bf16 autocast (less memory, slightly different numbers)
+  tile_size: 1008                # SAM 3's input size; larger images are processed in overlapping windows ...
+  tile_overlap: 128
+  tile_trigger: 1.5              # ... when their longest side exceeds tile_size * tile_trigger
+
+stage1_objects:                  # remove predicted damage that lies on non-structural objects
+  enabled: true
+  prompts: [ladder, fender, chain, rope, bollard, pipe, railing, cable, boat, buoy, sign, vegetation, person, artifacts]
+  score_threshold: 0.5           # SAM 3 instance confidence for an object to count
+  dilate_px: 3                   # grow object masks a little (damage hugging an object edge)
+  component_overlap_frac: 0.5    # drop a whole damage component if >= this fraction lies on objects;
+                                 # damage pixels on objects are removed in any case
+
+stage2_refine:                   # sharpen each remaining damage component with SAM 3's box/point predictor
+  enabled: true
+  classes: [Cracks, Wetspot, Spalling, Rust, Efflorescence]
+  min_area_px: 64                # smaller components are kept unchanged
+  max_components_per_class: 50   # largest first; the rest are kept unchanged (runtime cap)
+  crop_margin_frac: 0.25         # context around the component's box, fraction of its longest side
+  crop_margin_min_px: 32
+  num_pos_points: 3              # most confident MVP_clean pixels of the component, spread apart
+  multimask_output: true         # SAM proposes 3 masks; the one agreeing best with the component is used
+  min_iou_with_original: 0.3     # accept SAM's mask only if IoU with the original component >= this ...
+  min_mean_prob_frac: 0.5        # ... and MVP_clean's mean prob inside it >= this x the class threshold
+
+stage3_add:                      # look for missed damage similar to the confirmed components
+  enabled: true
+  use_text: true                 # text phrase + exemplar boxes (false = exemplar boxes only)
+  max_exemplars: 3               # largest confirmed components of the class in the window
+  score_threshold: 0.5
+  max_overlap_with_existing: 0.5 # instances mostly covered by existing predictions are known ones, skipped
+  min_mean_prob: 0.1             # MVP_clean must give the new region at least this mean probability
+  min_area_px: 64
+
+damage_phrases:                  # MVP_clean class -> SAM 3 text phrase (stage 3)
+  Cracks: crack
+  Wetspot: wet spot
+  Spalling: spalling
+  Rust: rust stain
+  Efflorescence: efflorescence
+
+coco_min_area_px: 16             # predictions.coco.json: drop components smaller than this (as MVP_clean)

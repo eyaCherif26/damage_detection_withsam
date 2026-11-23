@@ -1,0 +1,26 @@
+# Text phrases per class for SAM 3 (zero-shot or after LoRA). Keys = category names in the converted
+# _annotations.coco.json; each phrase is queried separately and the instances of a class are merged.
+# SAM 3 takes short noun phrases only (no instructions); wording adapted from the 7-class annotation guide.
+crack:
+  - crack
+  - concrete crack
+  - hairline crack
+  - crack network
+spalling:
+  - spalling
+  - spalled concrete
+  - broken concrete
+  - exposed rebar
+efflorescence:
+  - efflorescence
+  - white mineral deposit
+  - white lime streak
+rust:
+  - rust
+  - rust stain
+  - corrosion
+wet spot:
+  - wet spot
+  - moisture stain
+  - green algae
+  - dark water stain

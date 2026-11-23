@@ -1,0 +1,47 @@
+# Full CIF run on the 24 GB RTX PRO 4000 Blackwell.
+# Based on SAM3_LoRA/configs/light_lora_config.yaml. NOTE: the native trainer ignores mixed_precision,
+# gradient_accumulation_steps, scheduler/warmup and max_grad_norm (fp32, constant LR) - kept only for reference.
+# Needs the VLM_test patch in SAM3_LoRA/train_sam3_lora_native.py for best_metric / eval / wandb (below).
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+lora:
+  rank: 16                         # LoRA size; barely affects GPU memory
+  alpha: 32
+  dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
+  apply_to_vision_encoder: false   # frozen: saves the most memory (no backbone activations kept for backprop)
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: false     # true -> repo's naive attention builds a 5184x5184 matrix -> OOM (issue #39)
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+training:
+  data_dir: "/home/hydro/projects/VLM_test/data/cif_sam3_full"
+  batch_size: 1                    # batch 2 ran out of memory on 24 GB
+  num_workers: 8
+  num_negatives: 0                 # lower to 0-1 if it still runs out of memory
+  data_format: "coco"
+  prompt_source: "category_name"
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  num_epochs: 30
+  seed: 42
+  best_metric: val_macro_dice      # best_lora_weights.pt = highest val macro Dice (= F1), as MVP_clean; or val_loss
+eval:                              # per-class pixel metrics every epoch (VLM_test/scripts/sam3_eval.py, MVP_clean definitions)
+  max_images: 300                  # val images used (null = all of valid/)
+  train_max_images: 100            # train images, for the train-vs-val gap curves
+  threshold: 0.5                   # instance score threshold
+  no_data_validity: true           # exclude black no-data borders, as MVP_clean
+wandb:                             # same keys as MVP_clean's wandb block
+  entity: eya-cherif14
+  project: damage_detection
+  run_name: sam3_lora_cif_24gb
+  mode: online                     # online | offline | disabled
+  log_images_every_n_epochs: 5
+  num_logged_images: 8
+output:
+  output_dir: "/home/hydro/projects/VLM_test/outputs/sam3_cif_24gb"
+  save_lora_only: true
+hardware:
+  device: "cuda"

@@ -1,0 +1,46 @@
+# Smoke test on the 8 GB RTX 3050: does SAM3_LoRA train end to end on CIF? Not a real run.
+# Based on SAM3_LoRA/configs/light_lora_config.yaml. NOTE: the native trainer ignores mixed_precision,
+# gradient_accumulation_steps, scheduler/warmup and max_grad_norm (fp32, constant LR) - kept only for reference.
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+lora:
+  rank: 4
+  alpha: 8
+  dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
+  apply_to_vision_encoder: false   # frozen: saves the most memory (no backbone activations kept for backprop)
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: false     # true -> repo's naive attention builds a 5184x5184 matrix -> OOM (issue #39)
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+training:
+  data_dir: "/home/hydro/projects/VLM_test/data/cif_sam3_smoke"
+  batch_size: 1
+  num_workers: 2
+  num_negatives: 0
+  data_format: "coco"
+  prompt_source: "category_name"
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  num_epochs: 2
+  seed: 42
+  best_metric: val_macro_dice      # best_lora_weights.pt = highest val macro Dice (= F1), as MVP_clean; or val_loss
+eval:                              # per-class pixel metrics every epoch (VLM_test/scripts/sam3_eval.py)
+  max_images: null                 # all 10 smoke val images
+  train_max_images: 20
+  threshold: 0.5
+  no_data_validity: true
+wandb:                             # same keys as MVP_clean's wandb block
+  entity: eya-cherif14
+  project: damage_detection
+  run_name: sam3_lora_cif_smoke
+  mode: online                     # online | offline | disabled
+  log_images_every_n_epochs: 1     # every epoch for the 2-epoch smoke test
+  num_logged_images: 4
+output:
+  output_dir: "/home/hydro/projects/VLM_test/outputs/sam3_cif_smoke"
+  save_lora_only: true
+hardware:
+  device: "cuda"
