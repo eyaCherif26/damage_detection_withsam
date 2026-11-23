@@ -10,6 +10,8 @@ Input   --pred_root/<image>/   one folder per image from MVP_clean scripts/infer
 Output  --pred_root/<image>/sam3_pp/
           base/ s1/ s12/ s123/   mask_<class>.png (0/255, original size); base = MVP_clean prob >= its thresholds
           objects.png            union of the SAM 3 object masks used by stage 1
+        --pred_root/<image>/sam3_filtered/   (stage 1) prob_<class>.png zeroed on objects + removed components,
+          and run_info.json -> input for MVP_clean's hysteresis: postprocess_predictions.py --input_dir <this>
           predictions.coco.json  last variant: one instance per connected component (RLE; score = mean MVP_clean prob)
           overlay.jpg            last variant over the image, MVP_clean class colours, objects tinted grey
           sam3_info.json         settings + every decision (removed / refined / added components)
@@ -103,22 +105,88 @@ def components(mask: np.ndarray) -> tuple[np.ndarray, int, np.ndarray]:
 
 
 # ---------------------------------------------------------------- stage 1
-def detect_objects(proc, img: np.ndarray, cfg: dict, wins: list) -> tuple[np.ndarray, dict]:
+def detect_objects(proc, img: np.ndarray, cfg: dict, wins: list) -> tuple[np.ndarray, dict, dict, dict]:
+    """Object prompts -> one union mask (damage there is removed). Look-alike prompts (optional) -> kept as
+    separate instances (y0, x0, cropped mask) per phrase, used by remove_look_alikes()."""
     h, w = img.shape[:2]
     obj = np.zeros((h, w), dtype=bool)
-    found = {p: 0 for p in cfg["prompts"]}
-    proc.set_confidence_threshold(cfg["score_threshold"])
+    look = cfg.get("look_alike_prompts") or {}
+    phrases = list(dict.fromkeys(list(cfg["prompts"]) + list(look)))
+    found = {p: 0 for p in phrases}
+    best = {p: 0.0 for p in phrases}  # highest score per prompt (>= log floor; 0.0 = nothing above it)
+    instances = {p: [] for p in look}
+    thr = cfg["score_threshold"]
+    phrase_thr = {p: (look_alike_spec(look[p], cfg)[3] if p in look else thr) for p in phrases}
+    # no log_min_score / per-phrase thresholds = processor threshold as before
+    proc.set_confidence_threshold(min([thr, cfg.get("log_min_score", thr)] + list(phrase_thr.values())))
     for x, y, tw, th in wins:
         state = proc.set_image(Image.fromarray(img[y:y + th, x:x + tw]))
-        for prompt in cfg["prompts"]:
-            masks, _ = query(proc, state, prompt)
-            if len(masks):
-                obj[y:y + th, x:x + tw] |= masks.any(0)
-                found[prompt] += len(masks)
+        for prompt in phrases:
+            masks, scores = query(proc, state, prompt)
+            if len(scores):
+                best[prompt] = max(best[prompt], float(scores.max()))
+            keep = scores >= phrase_thr[prompt]
+            if not keep.any():
+                continue
+            found[prompt] += int(keep.sum())
+            if prompt in look:
+                for m in masks[keep]:
+                    ys, xs = np.nonzero(m)
+                    if len(ys):
+                        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+                        instances[prompt].append((y + y0, x + x0, m[y0:y1, x0:x1].copy()))
+            else:
+                obj[y:y + th, x:x + tw] |= masks[keep].any(0)
     d = int(cfg.get("dilate_px", 0))
     if d > 0:
         obj = cv2.dilate(obj.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1))) > 0
-    return obj, found
+    return obj, found, {p: round(s, 3) for p, s in best.items()}, instances
+
+
+def look_alike_spec(value, c1: dict) -> tuple[list, float, float | None, float]:
+    """look_alike_prompts entry -> (classes, min_overlap, max_area_ratio or None, score_threshold).
+    List form `phrase: [Cracks]` = global settings (original behaviour); dict form
+    `phrase: {classes: [...], min_overlap: .., max_area_ratio: null, score_threshold: ..}` overrides per phrase
+    (max_area_ratio: null = no size condition)."""
+    g_overlap = c1.get("look_alike_min_overlap", 0.5)
+    g_ratio = c1.get("look_alike_max_area_ratio", 4.0)
+    if isinstance(value, dict):
+        return (list(value["classes"]), value.get("min_overlap", g_overlap),
+                value.get("max_area_ratio", g_ratio), value.get("score_threshold", c1["score_threshold"]))
+    return list(value), g_overlap, g_ratio, c1["score_threshold"]
+
+
+def remove_look_alikes(mask: np.ndarray, instances: list, min_overlap: float, max_area_ratio: float | None,
+                       details: list | None = None) -> tuple[np.ndarray, int]:
+    """Remove damage components that essentially ARE a look-alike instance (e.g. a branch shadow predicted as a
+    crack): >= min_overlap of the component inside one instance whose area <= max_area_ratio x component area
+    (max_area_ratio None = no size condition). Damage inside a much larger instance (a big shaded area) is kept
+    unless the size condition is off. `details` (optional) collects per-component numbers for the log."""
+    lab, n, areas = components(mask)
+    if n == 0 or not instances:
+        return mask, 0
+    drop, best = set(), {}
+    for y0, x0, m in instances:
+        sub = lab[y0:y0 + m.shape[0], x0:x0 + m.shape[1]][m]
+        if not sub.size:
+            continue
+        inter = np.bincount(sub, minlength=n + 1)
+        inter[0] = 0
+        inst_area = int(m.sum())
+        for i in np.flatnonzero(inter):
+            frac, ratio = inter[i] / areas[i], inst_area / areas[i]
+            ok = frac >= min_overlap and (max_area_ratio is None or ratio <= max_area_ratio)
+            if ok:
+                drop.add(int(i))
+            if int(i) not in best or frac > best[int(i)][0]:
+                best[int(i)] = (frac, ratio, ok)
+    if details is not None:
+        for i, (frac, ratio, _) in best.items():
+            details.append({"component_area": int(areas[i]), "best_overlap": round(float(frac), 3),
+                            "instance_to_component_area": round(float(ratio), 1), "removed": i in drop})
+    if not drop:
+        return mask, 0
+    return mask & ~np.isin(lab, sorted(drop)), len(drop)
 
 
 def remove_on_objects(mask: np.ndarray, obj: np.ndarray, frac: float) -> tuple[np.ndarray, int, int]:
@@ -147,7 +215,10 @@ def pick_points(prob: np.ndarray, comp: np.ndarray, k: int, min_dist: int) -> np
     return np.array(pts, dtype=np.float64)
 
 
-def refine(predictor, img: np.ndarray, masks: dict, probs: dict, thresholds: dict, obj: np.ndarray, cfg: dict) -> tuple[dict, list]:
+@torch.inference_mode()
+def refine(proc, model, img: np.ndarray, masks: dict, probs: dict, thresholds: dict, obj: np.ndarray, cfg: dict) -> tuple[dict, list]:
+    """Box/point refinement via SAM 3's interactive predictor. It shares the detector's image encoder, so the
+    crop is encoded with proc.set_image and predicted with model.predict_inst (sam3/model/sam3_image.py)."""
     h, w = img.shape[:2]
     out, log = {}, []
     for c, m in masks.items():
@@ -166,8 +237,9 @@ def refine(predictor, img: np.ndarray, masks: dict, probs: dict, thresholds: dic
             comp = lab[cy0:cy1, cx0:cx1] == i
             prob = probs[c][cy0:cy1, cx0:cx1]
             pts = pick_points(prob, comp, cfg["num_pos_points"], max(3, int(0.15 * max(y1 - y0, x1 - x0))))
-            predictor.set_image(np.ascontiguousarray(img[cy0:cy1, cx0:cx1]))
-            cand, quality, _ = predictor.predict(
+            state = proc.set_image(Image.fromarray(np.ascontiguousarray(img[cy0:cy1, cx0:cx1])))
+            cand, quality, _ = model.predict_inst(
+                state,
                 point_coords=pts if len(pts) else None,
                 point_labels=np.ones(len(pts)) if len(pts) else None,
                 box=np.array([x0 - cx0, y0 - cy0, x1 - cx0, y1 - cy0], dtype=np.float64),
@@ -294,19 +366,50 @@ def process_image(d: Path, args, cfg: dict, proc, predictor) -> dict:
     obj_frac = c1["component_overlap_frac"]
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(s.get("bf16", False))):
         if c1["enabled"]:
-            obj, found = detect_objects(proc, img, c1, wins)
+            obj, found, best_scores, look_insts = detect_objects(proc, img, c1, wins)
             cv2.imwrite(str(dst / "objects.png"), obj.astype(np.uint8) * 255)
             stage1 = {}
             for c in classes:
                 masks[c], n_comp, n_px = remove_on_objects(masks[c], obj, obj_frac)
                 stage1[c] = {"components_removed": n_comp, "pixels_removed": n_px}
-            log["stage1"] = {"objects_found_per_prompt": found, "object_pixel_share": round(float(obj.mean()), 4),
+            look_cfg = c1.get("look_alike_prompts") or {}
+            if look_cfg:  # debug image: every look-alike instance SAM 3 found (e.g. shadows)
+                la = np.zeros((h, w), dtype=bool)
+                for insts in look_insts.values():
+                    for y0, x0, m in insts:
+                        la[y0:y0 + m.shape[0], x0:x0 + m.shape[1]] |= m
+                cv2.imwrite(str(dst / "look_alikes.png"), la.astype(np.uint8) * 255)
+            la_details = {}
+            for phrase, spec in look_cfg.items():
+                look_classes, min_ov, max_ratio, _ = look_alike_spec(spec, c1)
+                for c in look_classes:
+                    if c not in masks:
+                        print(f"[sam3_pp] WARNING: look_alike_prompts '{phrase}': class {c!r} not in {classes}")
+                        continue
+                    det = la_details.setdefault(f"{phrase} -> {c}", [])
+                    masks[c], n_la = remove_look_alikes(masks[c], look_insts[phrase], min_ov, max_ratio, det)
+                    stage1[c]["look_alike_components_removed"] = stage1[c].get("look_alike_components_removed", 0) + n_la
+            log["stage1"] = {"objects_found_per_prompt": found, "best_score_per_prompt": best_scores,
+                             "object_pixel_share": round(float(obj.mean()), 4),
                              "removed": stage1}
+            if la_details:  # per damage component touched by a look-alike: best overlap, size ratio, removed?
+                log["stage1"]["look_alike_details"] = {k: v[:300] for k, v in la_details.items()}
             save_variant(dst / "s1", masks)
             last = "s1"
+            # Filtered copy of MVP_clean's outputs for MVP_clean's own hysteresis post-processing
+            # (scripts/postprocess_predictions.py --input_dir <image>/sam3_filtered): probability set to 0
+            # on objects and on removed damage components, so hysteresis cannot grow back onto them.
+            filt = d / "sam3_filtered"
+            filt.mkdir(parents=True, exist_ok=True)
+            for c in classes:
+                removed = (probs[c] >= thresholds[c]) & ~masks[c]
+                pc = probs[c].copy()
+                pc[obj | removed] = 0.0
+                cv2.imwrite(str(filt / f"prob_{c}.png"), np.round(pc * 255).astype(np.uint8))
+            (filt / "run_info.json").write_text(json.dumps({**info, "sam3_filtered_from": str(d)}, indent=2))
         no_obj = obj if obj is not None else np.zeros((h, w), dtype=bool)
         if c2["enabled"]:
-            masks, refine_log = refine(predictor, img, masks, probs, thresholds, no_obj, c2)
+            masks, refine_log = refine(proc, predictor, img, masks, probs, thresholds, no_obj, c2)
             log["stage2"] = {"components_tried": len(refine_log),
                              "accepted": sum(r["accepted"] for r in refine_log), "components": refine_log}
             last = last + "2" if last == "s1" else "s2"
@@ -347,7 +450,7 @@ def main() -> None:
     model = build_sam3_image_model(bpe_path=cfg["sam3"]["bpe_path"], device="cuda", eval_mode=True,
                                    load_from_HF=True, enable_inst_interactivity=need_inst)
     proc = Sam3Processor(model)
-    predictor = model.inst_interactive_predictor if need_inst else None
+    predictor = model if need_inst else None  # stage 2 calls model.predict_inst (needs enable_inst_interactivity)
 
     dirs = sorted(d for d in Path(args.pred_root).iterdir() if (d / "run_info.json").exists())
     if not args.overwrite:
