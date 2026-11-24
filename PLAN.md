@@ -1,3 +1,10 @@
+# 2026-11-24: SAM 3 orthophoto inference in MVP_clean's output format
+- New scripts/sam3_infer_orthophoto.py: overlapping 1008-px tiles (linear-ramp blending), per-class heat maps
+  (sam3_eval.class_heatmap), no-data -> 0, outputs prob_<class>.png / predictions.coco.json (rle|polygon) /
+  overlay.png (+preview) / run_info.json exactly like MVP_clean infer_orthophoto.py -> MVP_clean post-processing
+  and sam3_postprocess.py run on it unchanged. Options as MVP_clean: --scale, --crop, --overlap, --min_area,
+  --thresholds (thresholds_best.json from heat-map validation). Not run yet.
+
 # 2026-11-23: LoRA on the DETR encoder (image-text fusion) on 24 GB, class-balanced 1k CIF subset
 - Memory fix = opt-in efficient attention (lora_layers use_sdpa via `optimizations.efficient_attention`) + optional
   bf16; SAM 3 already checkpoints activations in the DETR encoder and the ViT (use_act_checkpoint=True).
