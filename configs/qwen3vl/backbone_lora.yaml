@@ -1,0 +1,13 @@
+# Qwen3-VL vision-encoder backbone settings (VLM_test/qwen_seg/qwen3vl_semantic.py), passed with
+# scripts/run_mvp_clean.py --backbone_config. Use the SAME file for train, evaluate and inference.
+encoder_tuning: lora            # lora (vision tower frozen + LoRA) | frozen (decoder only) | full
+lora_rank: 16
+lora_alpha: 32.0
+lora_dropout: 0.05
+lora_target_modules: [qkv, proj]  # attention layers of every vision block
+feature_layers: [8, 16, 24, 26]   # 0-based blocks fed to the decoder (Qwen's deepstack layers + last of 27)
+hires_branch: true                # shallow stride-2 CNN branch for thin cracks
+gradient_checkpointing: true      # recompute vision blocks in backward (less GPU memory)
+decoder_dim: 256
+image_mean: [0.5, 0.5, 0.5]       # Qwen3-VL-8B preprocessor_config.json
+image_std: [0.5, 0.5, 0.5]

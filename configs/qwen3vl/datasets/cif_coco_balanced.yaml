@@ -1,0 +1,15 @@
+# cif_coco with the CLASS-BALANCED training subset (train/annotations.json, 7,026 tiles) instead of MVP_clean's
+# default full train file (annotations_all_ori.json, ~105k tiles). Same format as MVP_clean's
+# configs/data/datasets/cif_coco.yaml. SET THE PATHS for the machine you train on (placeholders below).
+# label_mapping_path is resolved relative to the MVP_clean folder.
+name: cif_coco
+images_roots:
+  train: /path/to/cif_coco/train/images
+  val: /path/to/cif_coco/val/images
+  test: /path/to/cif_coco/test/images
+annotations:
+  train: /path/to/cif_coco/train/annotations.json
+  val: /path/to/cif_coco/val/annotations.json
+  test: /path/to/cif_coco/test/annotations.json
+label_mapping_path: configs/data/label_maps/cif6_to_mvp5.yaml
+native_categories: [Algae, Crack, NetCrack, CrackPrecip, Net-Crack, Crack+Precip, Rust, Spalling]

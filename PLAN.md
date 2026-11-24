@@ -1,3 +1,15 @@
+# 2026-11-24: Qwen3-VL-8B vision encoder as a semantic-segmentation backbone (MVP_clean used as a library)
+Decisions: only the vision tower (27 layers, 1152 ch, 16-px patches; mean/std 0.5) + fpn_upernet_lite decoder +
+LoRA; code in VLM_test, MVP_clean unchanged (path = --mvp_clean_dir, the project has another name on the remote);
+runs: CIF balanced subset -> dacl10k -> combined, same settings as segformer_cif_512.
+- qwen_seg/qwen3vl_semantic.py: downloads only the shard with `model.visual.` weights (model-00004-of-00004 for 8B),
+  Qwen-processor patch layout, OFFICIAL Qwen3VLVisionModel forward + hooks on feature_layers [8,16,24,26],
+  ImageNet->Qwen renormalisation inside, LoRA (qkv, proj), register() into MVP_clean's registry.
+- scripts/run_mvp_clean.py: registers the backbone, runs any MVP_clean script (train/evaluate/infer_orthophoto/...).
+- configs/qwen3vl/: backbone_lora.yaml, qwen3vl_{cif,dacl,cif_dacl}_512.yaml, datasets/cif_coco_balanced.yaml
+  (placeholder paths, set by the user).
+- tests/test_qwen3vl_semantic.py: tiny random config, CPU. Not run yet.
+
 # 2026-11-23: lost changes re-applied (files had reverted to the ~2026-11-18 state during the git steps)
 Pushed as 3 separate branches / pull requests: (1) Full-LoRA optimizations (lora_layers use_sdpa, trainer
 `optimizations` block, configs/cif_full_24gb.yaml), (2) heat-map evaluation (sam3_eval.py --mode heatmap),
