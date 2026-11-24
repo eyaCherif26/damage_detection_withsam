@@ -9,6 +9,19 @@ runs: CIF balanced subset -> dacl10k -> combined, same settings as segformer_cif
 - configs/qwen3vl/: backbone_lora.yaml, qwen3vl_{cif,dacl,cif_dacl}_512.yaml, datasets/cif_coco_balanced.yaml
   (placeholder paths, set by the user).
 - tests/test_qwen3vl_semantic.py: tiny random config, CPU. Not run yet.
+# 2026-11-24: SAM 3 orthophoto inference in MVP_clean's output format
+- New scripts/sam3_infer_orthophoto.py: overlapping 1008-px tiles (linear-ramp blending), per-class heat maps
+  (sam3_eval.class_heatmap), no-data -> 0, outputs prob_<class>.png / predictions.coco.json (rle|polygon) /
+  overlay.png (+preview) / run_info.json exactly like MVP_clean infer_orthophoto.py -> MVP_clean post-processing
+  and sam3_postprocess.py run on it unchanged. Options as MVP_clean: --scale, --crop, --overlap, --min_area,
+  --thresholds (thresholds_best.json from heat-map validation). Not run yet.
+
+# 2026-11-23: LoRA on the DETR encoder (image-text fusion) on 24 GB, class-balanced 1k CIF subset
+- Memory fix = opt-in efficient attention (lora_layers use_sdpa via `optimizations.efficient_attention`) + optional
+  bf16; SAM 3 already checkpoints activations in the DETR encoder and the ViT (use_act_checkpoint=True).
+- configs/cif_detr_enc_smoke.yaml (40 imgs, 1 epoch) then configs/cif_detr_enc_1k.yaml (15 epochs).
+- cif_to_sam3_coco.py --balanced_per_class K (opt-in): rarest class first, each class in >= K images.
+- Compare with cif_24gb (decoder-only) using heat-map eval on the SAME validation/test images.
 
 # 2026-11-23: lost changes re-applied (files had reverted to the ~2026-11-18 state during the git steps)
 Pushed as 3 separate branches / pull requests: (1) Full-LoRA optimizations (lora_layers use_sdpa, trainer

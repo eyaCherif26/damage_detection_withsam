@@ -16,7 +16,7 @@ import argparse
 import json
 import os
 import random
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import yaml
@@ -39,6 +39,9 @@ def main() -> None:
     p.add_argument("--split", required=True, help="output split folder name: train / valid / test")
     p.add_argument("--prompt_name", nargs="*", default=[], help="Target=prompt overrides, e.g. Cracks=crack")
     p.add_argument("--max_images", type=int, default=None, help="random subset size (seeded)")
+    p.add_argument("--balanced_per_class", type=int, default=None, metavar="K",
+                   help="class-balanced subset instead of --max_images: images are added (seeded, rarest class "
+                        "first) until every class appears in at least K images (or all its images are used)")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -64,7 +67,31 @@ def main() -> None:
     cat_map = {cid: new_id[label_map[name]] for cid, name in native.items() if label_map[name] is not None}
 
     images = coco["images"]
-    if args.max_images is not None and args.max_images < len(images):
+    if args.balanced_per_class is not None:
+        if args.max_images is not None:
+            raise SystemExit("use either --max_images or --balanced_per_class, not both")
+        img_cls = defaultdict(set)  # image id -> target category ids present
+        for a in coco["annotations"]:
+            if a["category_id"] in cat_map:
+                img_cls[a["image_id"]].add(cat_map[a["category_id"]])
+        freq = Counter(c for cs in img_cls.values() for c in cs)
+        rng = random.Random(args.seed)
+        chosen, chosen_set, have = [], set(), Counter()
+        for c in sorted(freq, key=lambda c: (freq[c], c)):  # rarest class first
+            cand = [i for i, cs in img_cls.items() if c in cs and i not in chosen_set]
+            rng.shuffle(cand)
+            for i in cand:
+                if have[c] >= args.balanced_per_class:
+                    break
+                chosen.append(i)
+                chosen_set.add(i)
+                have.update(img_cls[i])
+        by_id = {im["id"]: im for im in images}
+        images = [by_id[i] for i in chosen]
+        id_name = {v: k for k, v in new_id.items()}
+        print(f"[balanced] {len(images)} images; images per class: "
+              f"{ {id_name[c]: have[c] for c in sorted(have)} }")
+    elif args.max_images is not None and args.max_images < len(images):
         images = random.Random(args.seed).sample(images, args.max_images)
     keep_ids = {im["id"] for im in images}
 
