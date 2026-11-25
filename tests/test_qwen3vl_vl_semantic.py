@@ -1,0 +1,81 @@
+"""qwen3vl_vl_semantic backbone: CPU tests with a tiny RANDOM full Qwen3-VL (vision + language model) and a stub
+tokenizer (no download, no MVP_clean).  Run from the VLM_test folder:
+    python -m pytest tests/test_qwen3vl_vl_semantic.py -q
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from qwen_seg.qwen3vl_vl_semantic import Qwen3VLVLSemanticModel  # noqa: E402
+
+qwen = pytest.importorskip("transformers.models.qwen3_vl.modeling_qwen3_vl")
+SIZE = 64  # 4x4 patches -> 2x2 = 4 image tokens
+IMG, VSTART, VEND = 5, 3, 4
+
+
+class StubTokenizer:
+    """Maps the prompt to ids: <|image_pad|> -> IMG, everything else -> a few fixed text ids."""
+
+    def __call__(self, text, add_special_tokens=False):
+        n = text.count("<|image_pad|>")
+        return {"input_ids": [1, 2, VSTART] + [IMG] * n + [VEND, 7, 8, 9]}
+
+
+def tiny_vlm():
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    cfg = Qwen3VLConfig(
+        vision_config=dict(depth=3, hidden_size=64, intermediate_size=128, num_heads=4, patch_size=16,
+                           spatial_merge_size=2, temporal_patch_size=2, out_hidden_size=32,
+                           num_position_embeddings=16, deepstack_visual_indexes=[0, 1, 2],
+                           rope_parameters={"rope_type": "axial", "rope_theta": 10000.0}),
+        text_config=dict(vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=3,
+                         num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+                         rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
+                                          "mrope_section": [2, 1, 1], "mrope_interleaved": True}),
+        image_token_id=IMG, video_token_id=6, vision_start_token_id=VSTART, vision_end_token_id=VEND,
+    )
+    cfg._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    return qwen.Qwen3VLModel(cfg).eval()
+
+
+def make(**kw) -> Qwen3VLVLSemanticModel:
+    settings = dict(encoder_tuning="lora", gradient_checkpointing=False, lora_rank=4)
+    settings.update(kw)
+    return Qwen3VLVLSemanticModel(num_classes=5, dropout=0.0, vlm=tiny_vlm(), tokenizer=StubTokenizer(), **settings)
+
+
+def test_output_shape():
+    model = make()
+    assert model.feature_layers == [0, 1, 2, 2]  # deepstack layers + last block, from the config
+    assert model(torch.randn(2, 3, SIZE, SIZE)).shape == (2, 5, SIZE, SIZE)
+
+
+def test_language_model_frozen_and_not_in_module():
+    model = make()
+    lm = model._vlm[0].language_model
+    assert not any(p.requires_grad for p in lm.parameters())
+    own = {id(p) for p in model.parameters()}
+    assert not any(id(p) in own for p in lm.parameters())
+    assert not any(k.startswith("_vlm") or "language_model" in k for k in model.state_dict())
+
+
+def test_trainable_set_and_gradient_reaches_vision_lora():
+    model = make().train()
+    model(torch.randn(2, 3, SIZE, SIZE)).sum().backward()
+    lora_b = [m.lora_B.weight for blk in model.visual.blocks for m in (blk.attn.qkv, blk.attn.proj)]
+    assert any(w.grad is not None and w.grad.abs().sum() > 0 for w in lora_b)
+    enc_trainable = {n for n, p in model.visual.named_parameters() if p.requires_grad}
+    assert enc_trainable and all(".lora_" in n for n in enc_trainable)
+
+
+def test_prompt_has_one_image_token_per_merged_patch():
+    model = make()
+    ids = model._prompt_ids(4)
+    assert int((ids == IMG).sum()) == 4

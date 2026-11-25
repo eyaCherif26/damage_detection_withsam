@@ -1,0 +1,15 @@
+# Qwen3-VL vision encoder + LANGUAGE MODEL backbone settings (model.name: qwen3vl_vl_semantic,
+# VLM_test/qwen_seg/qwen3vl_vl_semantic.py). Use the SAME file for train, evaluate and inference.
+encoder_tuning: lora              # vision encoder: lora (frozen + LoRA) | frozen | full. Language model: always frozen.
+lora_rank: 16
+lora_alpha: 32.0
+lora_dropout: 0.05
+lora_target_modules: [qkv, proj]
+feature_layers: null              # null = deepstack layers + last block of the loaded model ([5, 11, 17, 23] for 4B)
+hires_branch: true
+gradient_checkpointing: true      # vision encoder AND language model (saves GPU memory)
+decoder_dim: 256
+image_mean: [0.5, 0.5, 0.5]       # Qwen3-VL-4B preprocessor_config.json
+image_std: [0.5, 0.5, 0.5]
+instruction: "Segment cracks, spalling, efflorescence, wet spots and rust."
+llm_layers: [-1]                  # language-model hidden states used as "semantic grounding" (-1 = last layer)

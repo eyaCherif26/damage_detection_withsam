@@ -55,10 +55,12 @@ def main() -> None:
     sys.path.insert(0, str(mvp))
     import models  # noqa: F401  (MVP_clean: registers its built-in backbones)
     from qwen_seg.qwen3vl_semantic import register
+    from qwen_seg.qwen3vl_vl_semantic import register as register_vl
 
     settings = yaml.safe_load(args.backbone_config.read_text()) or {}
-    register(settings)
-    print(f"[run_mvp_clean] registered qwen3vl_semantic with {args.backbone_config}: {settings}")
+    register(settings)      # model.name: qwen3vl_semantic    (vision encoder only)
+    register_vl(settings)   # model.name: qwen3vl_vl_semantic (vision encoder + language model)
+    print(f"[run_mvp_clean] registered qwen3vl_semantic / qwen3vl_vl_semantic with {args.backbone_config}: {settings}")
 
     if args.script == "train" and (cfg_path := _arg_value(rest, "--config")):  # provenance
         from configs.loader import load_experiment_config

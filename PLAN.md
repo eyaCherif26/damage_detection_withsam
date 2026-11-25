@@ -9,6 +9,17 @@ runs: CIF balanced subset -> dacl10k -> combined, same settings as segformer_cif
 - configs/qwen3vl/: backbone_lora.yaml, qwen3vl_{cif,dacl,cif_dacl}_512.yaml, datasets/cif_coco_balanced.yaml
   (placeholder paths, set by the user).
 - tests/test_qwen3vl_semantic.py: tiny random config, CPU. Not run yet.
+- 2026-11-25: smoke test (1 epoch) passed on the remote. New configs/qwen3vl/qwen3vl_native_cif_512.yaml
+  (native_crop 512, data settings 1:1 from segformer_native_cif_512.yaml, balanced CIF): consistent with
+  native-scale orthophoto inference; Qwen's vision encoder is natively dynamic-resolution.
+- 2026-11-25: vision + language experiment (user: Qwen3-VL-4B bf16, one output = 5 per-class masks):
+  new qwen_seg/qwen3vl_vl_semantic.py (`qwen3vl_vl_semantic`): full Qwen3VLModel forward with a fixed instruction;
+  vision features (hooks, deepstack+last = [5,11,17,23] for 4B) + language-model hidden states at the image tokens
+  (semantic grounding, stride 32) added to the decoder's stride-32 level; language model frozen, kept OUT of the
+  module/state_dict (small checkpoints), gradients flow through it into the vision LoRA; grad checkpointing on both.
+  Small behaviour-preserving changes in qwen3vl_semantic.py (feature_layers null = from config, decoder `extra`
+  input, LoRA dtype-safe). Configs: backbone_vl_lora.yaml, backbone_lora_4b.yaml, qwen3vl4b_native_cif_512.yaml
+  (vision-only 4B baseline), qwen3vl4b_vl_native_cif_512.yaml. Tests: tests/test_qwen3vl_vl_semantic.py. Not run.
 # 2026-11-24: SAM 3 orthophoto inference in MVP_clean's output format
 - New scripts/sam3_infer_orthophoto.py: overlapping 1008-px tiles (linear-ramp blending), per-class heat maps
   (sam3_eval.class_heatmap), no-data -> 0, outputs prob_<class>.png / predictions.coco.json (rle|polygon) /

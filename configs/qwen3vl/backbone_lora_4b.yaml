@@ -1,0 +1,14 @@
+# Vision-encoder-only backbone (model.name: qwen3vl_semantic) for Qwen3-VL-4B: the baseline for
+# qwen3vl_vl_semantic (same vision encoder, same settings, no language branch). Same as backbone_lora.yaml except
+# feature_layers: null (the 4B vision encoder has 24 blocks, deepstack layers 5/11/17).
+encoder_tuning: lora
+lora_rank: 16
+lora_alpha: 32.0
+lora_dropout: 0.05
+lora_target_modules: [qkv, proj]
+feature_layers: null              # = deepstack layers + last block of the loaded model ([5, 11, 17, 23] for 4B)
+hires_branch: true
+gradient_checkpointing: true
+decoder_dim: 256
+image_mean: [0.5, 0.5, 0.5]
+image_std: [0.5, 0.5, 0.5]
