@@ -40,7 +40,7 @@ DEFAULT_SETTINGS = {
     "lora_alpha": 32.0,
     "lora_dropout": 0.05,
     "lora_target_modules": ["qkv", "proj"],  # Qwen3VLVisionAttention linear layers
-    "feature_layers": [8, 16, 24, 26],   # 0-based block indices (deepstack layers + last)
+    "feature_layers": [8, 16, 24, 26],   # 0-based block indices (deepstack layers + last); null = from config
     "hires_branch": True,
     "gradient_checkpointing": True,
     "decoder_dim": 256,
@@ -90,7 +90,11 @@ class LoRALinear(nn.Module):
         self.scaling = alpha / rank
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+        y = self.base(x)
+        # dtype casts are no-ops when base and adapters share a dtype (fp32 vision-only model); they let fp32
+        # adapters sit on a bf16 base (qwen3vl_vl_semantic) also outside autocast
+        d = self.lora_B(self.lora_A(self.lora_dropout(x.to(self.lora_A.weight.dtype))))
+        return y + (d * self.scaling).to(y.dtype)
 
 
 def _conv_gn(cin: int, cout: int, k: int = 3, stride: int = 1) -> nn.Sequential:
@@ -118,8 +122,12 @@ class FpnUperNetLite(nn.Module):
         self.smooth = nn.ModuleList([_conv_gn(dim, dim) for _ in chans])
         self.fuse = _conv_gn(4 * dim, dim)
 
-    def forward(self, feats: list[torch.Tensor]) -> torch.Tensor:
+    def forward(self, feats: list[torch.Tensor], extra: torch.Tensor | None = None) -> torch.Tensor:
+        """extra (optional, dim channels): added to the coarsest (stride-32) level before the top-down pass, e.g.
+        language-conditioned features (qwen3vl_vl_semantic). None = original behaviour."""
         lat = [l(r(f)) for f, r, l in zip(feats, self.rescale, self.lateral)]
+        if extra is not None:
+            lat[3] = lat[3] + F.interpolate(extra, size=lat[3].shape[-2:], mode="bilinear", align_corners=False)
         for i in range(len(lat) - 2, -1, -1):  # top-down
             lat[i] = lat[i] + F.interpolate(lat[i + 1], size=lat[i].shape[-2:], mode="bilinear", align_corners=False)
         outs = [s(x) for s, x in zip(self.smooth, lat)]
@@ -162,7 +170,9 @@ class Qwen3VLSemanticModel(nn.Module):
         self.encoder = vision_model if vision_model is not None else load_qwen_vision_model(model_id)
         cfg = self.encoder.config
         self.patch, self.merge, self.temporal = cfg.patch_size, cfg.spatial_merge_size, cfg.temporal_patch_size
-        self.feature_layers = [int(i) for i in s["feature_layers"]]
+        fl = s["feature_layers"]  # None = from the model config: deepstack layers + last block
+        self.feature_layers = [int(i) for i in (fl if fl is not None else
+                                                 list(cfg.deepstack_visual_indexes) + [cfg.depth - 1])]
         if len(self.feature_layers) != 4 or max(self.feature_layers) >= cfg.depth:
             raise ValueError(f"feature_layers must be 4 block indices < depth {cfg.depth}, got {self.feature_layers}")
         hidden = cfg.hidden_size
