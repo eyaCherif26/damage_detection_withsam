@@ -12,8 +12,54 @@ gradient_checkpointing: true      # vision encoder AND language model (saves GPU
 decoder_dim: 256
 image_mean: [0.5, 0.5, 0.5]       # Qwen3-VL-4B preprocessor_config.json
 image_std: [0.5, 0.5, 0.5]
-instruction: "Segment cracks, spalling, efflorescence, wet spots and rust."
 llm_layers: [-1]                  # language-model hidden states used as "semantic grounding" (-1 = last layer)
+instruction_position: before      # instruction BEFORE the image: the causal LLM reads every image token in its context
+# fixed task context, added automatically to every image (train and inference); the input is only the image.
+# Same text as backbone_vl_lora.yaml (frozen LLM) so the two runs differ only in llm_tuning.
+instruction: |
+  Task: Annotate visible damage in bridge inspection photographs (concrete, steel, masonry; decks, slabs, girders, soffits, piers, abutments, parapets, joints, bearings and related components). Identify the material and component from the image. Segment Spalling, Crack, Efflorescence, Rust and Wetspot.
+
+  SPALLING: A piece of concrete or masonry has broken off, leaving a visible recess with rough, broken edges below the surrounding surface.
+  - Surface spall or cover loss: a shallow, irregular patch where the outer concrete layer is missing, with or without visible reinforcement.
+  - Spall with exposed reinforcement: bars, stirrups or tendon ducts visible in the recess because the cover has broken away.
+  - Edge and corner spall: broken-off pieces along edges, corners, joints, cornices and bearing plinths.
+  - Local defect: a small, clearly bounded missing patch, visibly larger and deeper than ordinary surface pores.
+  - Broken protective concrete or encasement at tendon anchorages or around tendons.
+  - Masonry: broken, split-off or missing faces of stones or bricks.
+
+  CRACK: A thin, dark, irregular line where the material has split. It usually wanders, branches and tapers out, unlike straight, regular joints.
+  - Single cracks (near-surface and through cracks look alike in a photo): longitudinal, transverse or diagonal lines on decks, girders, soffits, piers, abutments and caps.
+  - Water-bearing cracks: a crack with a damp dark band, white sinter or a rust streak along or below it.
+  - Map, network or crazing cracks (including alkali-silica reaction cracking): connected cracks forming an irregular polygon pattern, often with darker or whitish crack edges.
+  - Settlement and plinth cracks: often wider, diagonal or stepped cracks near supports and bearings.
+  - Cracked protective concrete or encasement around tendons and anchorages.
+  - Masonry: cracks running through stones (split stones, arch face-ring cracks), or along a mortar joint where the mortar is visibly split.
+  - Steel: hairline cracks in welds or plates, often visible as a thin rust line.
+
+  EFFLORESCENCE: White to light-grey mineral deposits left on the surface when water seeping through the material evaporates. The deposit sits on top of the surface and looks chalky, crusty or dripping.
+  - Bloom: a thin white haze, powder or film, usually patchy, around joints and cracks.
+  - Sinter crusts and lime runs: thicker white crusts, drip trails or small stalactites coming out of cracks, construction joints or drainage points, especially on soffits.
+  - Local or large-area deposits on decks, piers, caps, coatings and masonry joints.
+  It often occurs together with dampness; the damp zone itself is Wetspot. Rust-coloured bloom from iron-bearing aggregate is Rust.
+
+  RUST: Orange, red-brown or dark-brown corrosion of steel, or the stains it leaves on other surfaces.
+  - Rust stains on concrete or masonry: orange-brown streaks running down from a crack, joint, anchor, fixing or exposed bar.
+  - Rust spots from iron-bearing aggregate: small, isolated orange-brown dots with a faint halo on concrete.
+  - Corroded exposed reinforcement or tendons: rusty bars or ducts inside a spall (also part of Spalling).
+  - Rust breaking through coatings on steel: rust spots or areas on painted steel, typically at edges, rivets, bolts, welds and gaps (edge, rivet and crevice corrosion).
+  - Heavy corrosion: flaking rust scales and a pitted steel surface.
+  - Rusted anchors, bearing parts and fittings.
+
+  WETSPOT: Surface areas that look darker because water soaks into or runs over them, or that carry thin biological growth.
+  - Local or large-area dampness: darker, irregular, cloud-like patches with soft edges, typically below joints, drains, cracks and cap edges.
+  - Water outlet streaks: dark vertical tracks running down from joints, drainage outlets, cracks or cap edges.
+  - Damp bearing areas: darkened zones on bearing shelves and plinths.
+  - Algae, moss film and biological staining: green, black or grey-green films on the surface.
+  - Waterline and tide marks: horizontal dark bands on piers and abutments.
+
+  NOT DAMAGE: Do not annotate equipment, ropes, cables, ladders, loose debris, vegetation, sky, water, designed joints or recesses, hardware or image artifacts as damage. Bearings, drainage elements and other components are context, although qualifying damage on a component may be annotated. Respect occlusions and image boundaries.
+
+  LOOK-ALIKES: Do not mistake shadow for Wetspot, a dark joint for Crack, a shadowed recess for Spalling, or glare or paint for Efflorescence.
 llm_tuning: lora                  # frozen (default, = backbone_vl_lora.yaml) | lora
 llm_lora_rank: 16
 llm_lora_alpha: 32.0

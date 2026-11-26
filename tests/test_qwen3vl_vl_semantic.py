@@ -4,6 +4,7 @@ tokenizer (no download, no MVP_clean).  Run from the VLM_test folder:
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -19,11 +20,17 @@ IMG, VSTART, VEND = 5, 3, 4
 
 
 class StubTokenizer:
-    """Maps the prompt to ids: <|image_pad|> -> IMG, everything else -> a few fixed text ids."""
+    """Special tokens -> fixed ids (<|image_pad|> -> IMG), every other character -> one text id (vocab 32), so the
+    ids follow the real order of image and instruction in the prompt."""
+
+    SPECIAL = {"<|im_start|>": 1, "<|im_end|>": 2, "<|vision_start|>": VSTART, "<|vision_end|>": VEND,
+               "<|image_pad|>": IMG}
 
     def __call__(self, text, add_special_tokens=False):
-        n = text.count("<|image_pad|>")
-        return {"input_ids": [1, 2, VSTART] + [IMG] * n + [VEND, 7, 8, 9]}
+        ids = []
+        for part in re.split(r"(<\|[a-z_]+\|>)", text):
+            ids += [self.SPECIAL[part]] if part in self.SPECIAL else [10 + ord(c) % 22 for c in part]
+        return {"input_ids": ids}
 
 
 def tiny_vlm():
@@ -94,3 +101,19 @@ def test_llm_lora_trained_and_saved_without_base_llm():
     assert any(m["B"].weight.grad is not None and m["B"].weight.grad.abs().sum() > 0 for m in model.llm_lora)
     lm = model._vlm[0].language_model
     assert not any(p.requires_grad for n, p in lm.named_parameters() if ".lora_" not in n)
+
+
+@pytest.mark.parametrize("position", ["after", "before"])
+def test_instruction_reaches_image_tokens_only_when_before(position):
+    """Causal LLM: with the instruction AFTER the image, changing it cannot change the output; BEFORE, it does."""
+    model = make(instruction_position=position).eval()
+    x = torch.randn(1, 3, SIZE, SIZE)
+    with torch.no_grad():
+        model.settings["instruction"], model._prompt_cache = "Segment cracks.", {}
+        a = model(x)
+        model.settings["instruction"], model._prompt_cache = "Find rust stains and wet spots on piers.", {}
+        b = model(x)
+    if position == "after":
+        assert torch.allclose(a, b, atol=1e-5)
+    else:
+        assert not torch.allclose(a, b, atol=1e-5)

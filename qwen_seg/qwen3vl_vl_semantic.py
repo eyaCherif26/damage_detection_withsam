@@ -4,7 +4,8 @@ semantic grounding -> segmentation decoder" design, with ONE output: the 5 per-c
 
 One forward pass of the full Qwen3VLModel (default Qwen/Qwen3-VL-4B-Instruct, bf16) on the image + a fixed text
 instruction (Qwen chat format: <|im_start|>user\\n<|vision_start|><|image_pad|>x N<|vision_end|>instruction
-<|im_end|>\\n):
+<|im_end|>\\n; with `instruction_position: before` the instruction comes first, so the causal LLM processes the
+image tokens in its context):
   * spatial features: hidden states of the vision blocks in `feature_layers` (default: the model's deepstack
     layers + last block), via forward hooks -> (B, C_vis, H/16, W/16), as in qwen3vl_semantic;
   * semantic grounding: the language model's hidden states (`llm_layers`, default last) at the image-token
@@ -45,6 +46,10 @@ VL_DEFAULT_SETTINGS = {
     "feature_layers": None,  # None = deepstack layers + last block of the loaded model ([5, 11, 17, 23] for 4B)
     "instruction": "Segment cracks, spalling, efflorescence, wet spots and rust.",
     "llm_layers": [-1],      # language-model hidden_states indices (0 = embeddings, -1 = last)
+    # where the instruction goes in the prompt. The LLM is causal (a token only sees earlier tokens), so with
+    # "after" the image tokens - whose hidden states feed the decoder - never see the instruction; with "before"
+    # every image token is processed in the context of the instruction. Default "after" = old behaviour.
+    "instruction_position": "after",
     # language model tuning: "frozen" (default) or "lora" (LoRA on the listed linear layers of every LLM layer;
     # only the small LoRA matrices are trained and saved, the 4B base weights stay frozen and out of the checkpoint)
     "llm_tuning": "frozen",
@@ -79,6 +84,8 @@ class Qwen3VLVLSemanticModel(nn.Module):
             raise ValueError(f"encoder_tuning must be lora/frozen/full, got {s['encoder_tuning']!r}")
         if s["llm_tuning"] not in ("frozen", "lora"):
             raise ValueError(f"llm_tuning must be frozen/lora, got {s['llm_tuning']!r}")
+        if s["instruction_position"] not in ("before", "after"):
+            raise ValueError(f"instruction_position must be before/after, got {s['instruction_position']!r}")
         self.settings = s
         if vlm is None:
             vlm, tokenizer = load_qwen_vl(model_id)
@@ -156,10 +163,13 @@ class Qwen3VLVLSemanticModel(nn.Module):
         return self
 
     def _prompt_ids(self, n_image_tokens: int) -> torch.Tensor:
-        """Token ids of one user turn: image placeholder (n tokens) + instruction, Qwen3-VL chat format."""
+        """Token ids of one user turn: image placeholder (n tokens) + instruction (after or before the image,
+        `instruction_position`), Qwen3-VL chat format."""
         if n_image_tokens not in self._prompt_cache:
-            text = ("<|im_start|>user\n<|vision_start|>" + "<|image_pad|>" * n_image_tokens + "<|vision_end|>"
-                    + self.settings["instruction"] + "<|im_end|>\n")
+            image = "<|vision_start|>" + "<|image_pad|>" * n_image_tokens + "<|vision_end|>"
+            instr = self.settings["instruction"]
+            body = instr + image if self.settings["instruction_position"] == "before" else image + instr
+            text = "<|im_start|>user\n" + body + "<|im_end|>\n"
             ids = torch.as_tensor(self.tokenizer(text, add_special_tokens=False)["input_ids"], dtype=torch.long)
             if int((ids == self.image_token_id).sum()) != n_image_tokens:
                 raise ValueError("tokenizer did not map <|image_pad|> to one image token per placeholder")

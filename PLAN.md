@@ -25,6 +25,12 @@ runs: CIF balanced subset -> dacl10k -> combined, same settings as segformer_cif
   trained with lr_backbone (frozen_epochs applies) and saved, base LLM still frozen + out of the checkpoint.
   Configs: backbone_vl_llmlora.yaml, qwen3vl4b_vl_llmlora_native_cif_512.yaml (= vl_native config, new name).
   Test: test_llm_lora_trained_and_saved_without_base_llm. Not run.
+- 2026-11-26: ORDER FIX. The LLM is causal; with the instruction after the image, the image-token hidden states
+  (what the decoder reads) never saw the instruction. New setting `instruction_position: before|after` (code default
+  after = old behaviour, so old copied backbone_config.yaml files reproduce). backbone_vl_lora.yaml (frozen LLM) and
+  backbone_vl_llmlora.yaml (LLM LoRA) now use `before` + the same detailed bridge-inspection prompt (user's text,
+  German terms removed, no new info; 5 MVP classes only - Washouts/Graffiti dropped, no output channel).
+  Test: test_instruction_reaches_image_tokens_only_when_before (after: output unchanged; before: changes). Not run.
 # 2026-11-24: SAM 3 orthophoto inference in MVP_clean's output format
 - New scripts/sam3_infer_orthophoto.py: overlapping 1008-px tiles (linear-ramp blending), per-class heat maps
   (sam3_eval.class_heatmap), no-data -> 0, outputs prob_<class>.png / predictions.coco.json (rle|polygon) /
