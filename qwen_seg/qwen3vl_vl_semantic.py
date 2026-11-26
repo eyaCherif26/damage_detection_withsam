@@ -15,6 +15,9 @@ same decoder / hi-res branch / output as qwen3vl_semantic.
 Training: vision encoder frozen + LoRA (or frozen / full, `encoder_tuning`), decoder trained; the language model
 is FROZEN and NOT part of this module's parameters or state_dict (kept outside the module tree), so checkpoints
 stay small and MVP_clean's optimizer never sees it. Gradients still flow through it into the vision LoRA.
+Opt-in `llm_tuning: lora`: LoRA on the language model's attention projections; only the LoRA matrices are
+registered (`llm_lora.*`), trained with lr_backbone and saved - the base LLM weights stay frozen and out of the
+checkpoint.
 """
 from __future__ import annotations
 
@@ -42,6 +45,13 @@ VL_DEFAULT_SETTINGS = {
     "feature_layers": None,  # None = deepstack layers + last block of the loaded model ([5, 11, 17, 23] for 4B)
     "instruction": "Segment cracks, spalling, efflorescence, wet spots and rust.",
     "llm_layers": [-1],      # language-model hidden_states indices (0 = embeddings, -1 = last)
+    # language model tuning: "frozen" (default) or "lora" (LoRA on the listed linear layers of every LLM layer;
+    # only the small LoRA matrices are trained and saved, the 4B base weights stay frozen and out of the checkpoint)
+    "llm_tuning": "frozen",
+    "llm_lora_rank": 16,
+    "llm_lora_alpha": 32.0,
+    "llm_lora_dropout": 0.05,
+    "llm_lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],  # Qwen3VLTextAttention (self_attn)
 }
 
 
@@ -67,6 +77,8 @@ class Qwen3VLVLSemanticModel(nn.Module):
             raise ValueError(f"unknown qwen3vl_vl backbone setting(s) {sorted(unknown)}; known: {sorted(VL_DEFAULT_SETTINGS)}")
         if s["encoder_tuning"] not in ("lora", "frozen", "full"):
             raise ValueError(f"encoder_tuning must be lora/frozen/full, got {s['encoder_tuning']!r}")
+        if s["llm_tuning"] not in ("frozen", "lora"):
+            raise ValueError(f"llm_tuning must be frozen/lora, got {s['llm_tuning']!r}")
         self.settings = s
         if vlm is None:
             vlm, tokenizer = load_qwen_vl(model_id)
@@ -95,6 +107,21 @@ class Qwen3VLVLSemanticModel(nn.Module):
                     if not isinstance(base, nn.Linear):
                         raise ValueError(f"LoRA target {name!r} is not an nn.Linear in the Qwen3-VL vision attention")
                     setattr(blk.attn, name, LoRALinear(base, s["lora_rank"], s["lora_alpha"], s["lora_dropout"]))
+        # LoRA on the language model (opt-in). The wrapped layers live inside the (unregistered) language model;
+        # only their small A/B matrices are registered here, so they are trained, optimised and checkpointed.
+        llm_lora = []
+        if s["llm_tuning"] == "lora":
+            for layer in vlm.language_model.layers:
+                for name in s["llm_lora_target_modules"]:
+                    owner = next((m for m in (layer.self_attn, layer.mlp) if isinstance(getattr(m, name, None), nn.Linear)),
+                                 None)
+                    if owner is None:
+                        raise ValueError(f"LLM LoRA target {name!r} is not an nn.Linear in self_attn or mlp")
+                    wrapped = LoRALinear(getattr(owner, name), s["llm_lora_rank"], s["llm_lora_alpha"],
+                                         s["llm_lora_dropout"])
+                    setattr(owner, name, wrapped)
+                    llm_lora.append(nn.ModuleDict({"A": wrapped.lora_A, "B": wrapped.lora_B}))
+        self.llm_lora = nn.ModuleList(llm_lora)
         if s["gradient_checkpointing"]:
             kw = {"gradient_checkpointing_kwargs": {"use_reentrant": False}}
             self.visual.gradient_checkpointing_enable(**kw)
@@ -174,14 +201,18 @@ class Qwen3VLVLSemanticModel(nn.Module):
 
     # ---- MVP_clean registry contract
     def backbone_parameters(self):
+        """Trainable encoder params (vision LoRA / none / all vision weights) + the language-model LoRA matrices
+        (llm_tuning: lora). All get lr_backbone and follow MVP_clean's frozen_epochs."""
         if self.settings["encoder_tuning"] == "lora":
-            return [p for n, p in self.visual.named_parameters() if ".lora_" in n]
-        if self.settings["encoder_tuning"] == "frozen":
-            return []
-        return list(self.visual.parameters())
+            vis = [p for n, p in self.visual.named_parameters() if ".lora_" in n]
+        elif self.settings["encoder_tuning"] == "frozen":
+            vis = []
+        else:
+            vis = list(self.visual.parameters())
+        return vis + list(self.llm_lora.parameters())
 
     def head_parameters(self):
-        return [p for n, p in self.named_parameters() if not n.startswith("visual.")]
+        return [p for n, p in self.named_parameters() if not n.startswith(("visual.", "llm_lora."))]
 
     def trainable_summary(self) -> str:
         trainable = sum(p.numel() for p in self.backbone_parameters()) + sum(p.numel() for p in self.head_parameters())
