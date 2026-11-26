@@ -79,3 +79,18 @@ def test_prompt_has_one_image_token_per_merged_patch():
     model = make()
     ids = model._prompt_ids(4)
     assert int((ids == IMG).sum()) == 4
+
+
+def test_llm_lora_trained_and_saved_without_base_llm():
+    model = make(llm_tuning="lora", llm_lora_rank=2).train()
+    assert len(model.llm_lora) == 3 * 4  # 3 tiny LLM layers x q/k/v/o
+    sd = model.state_dict()
+    assert any(k.startswith("llm_lora.") for k in sd)
+    assert not any(k.startswith("_vlm") or "language_model" in k for k in sd)  # base LLM still not saved
+    llm_ids = {id(p) for p in model.llm_lora.parameters()}
+    assert llm_ids <= {id(p) for p in model.backbone_parameters()}
+    assert not llm_ids & {id(p) for p in model.head_parameters()}
+    model(torch.randn(2, 3, SIZE, SIZE)).sum().backward()
+    assert any(m["B"].weight.grad is not None and m["B"].weight.grad.abs().sum() > 0 for m in model.llm_lora)
+    lm = model._vlm[0].language_model
+    assert not any(p.requires_grad for n, p in lm.named_parameters() if ".lora_" not in n)

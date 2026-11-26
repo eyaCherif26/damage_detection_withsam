@@ -20,6 +20,11 @@ runs: CIF balanced subset -> dacl10k -> combined, same settings as segformer_cif
   Small behaviour-preserving changes in qwen3vl_semantic.py (feature_layers null = from config, decoder `extra`
   input, LoRA dtype-safe). Configs: backbone_vl_lora.yaml, backbone_lora_4b.yaml, qwen3vl4b_native_cif_512.yaml
   (vision-only 4B baseline), qwen3vl4b_vl_native_cif_512.yaml. Tests: tests/test_qwen3vl_vl_semantic.py. Not run.
+- 2026-11-26: opt-in LoRA on the LANGUAGE MODEL (`llm_tuning: lora`, default frozen = old behaviour unchanged):
+  LoRA (r16, a32) on q/k/v/o_proj of every LLM layer; only the A/B matrices are registered (`llm_lora.*`) ->
+  trained with lr_backbone (frozen_epochs applies) and saved, base LLM still frozen + out of the checkpoint.
+  Configs: backbone_vl_llmlora.yaml, qwen3vl4b_vl_llmlora_native_cif_512.yaml (= vl_native config, new name).
+  Test: test_llm_lora_trained_and_saved_without_base_llm. Not run.
 # 2026-11-24: SAM 3 orthophoto inference in MVP_clean's output format
 - New scripts/sam3_infer_orthophoto.py: overlapping 1008-px tiles (linear-ramp blending), per-class heat maps
   (sam3_eval.class_heatmap), no-data -> 0, outputs prob_<class>.png / predictions.coco.json (rle|polygon) /
